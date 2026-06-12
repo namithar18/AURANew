@@ -56,16 +56,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 # Constants derived from inspection of the dataset
 # ─────────────────────────────────────────────────────────────────────────────
 
-# All CSV files in the MachineLearningCVE folder, ordered by weekday.
 CSV_FILES: List[str] = [
-    "dataset\Monday-WorkingHours.pcap_ISCX.csv",
-    "dataset\Tuesday-WorkingHours.pcap_ISCX.csv",
-    "dataset\Wednesday-workingHours.pcap_ISCX.csv",
-    "dataset\Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv",
-    "dataset\Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv",
-    "dataset\Friday-WorkingHours-Morning.pcap_ISCX.csv",
-    "dataset\Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv",
-    "dataset\Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv",
+    "Monday-WorkingHours.pcap_ISCX.csv",
+    "Tuesday-WorkingHours.pcap_ISCX.csv",
+    "Wednesday-workingHours.pcap_ISCX.csv",
+    "Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv",
+    "Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv",
+    "Friday-WorkingHours-Morning.pcap_ISCX.csv",
+    "Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv",
+    "Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -154,7 +153,7 @@ def _assign_synthetic_nodes(
     df: pd.DataFrame,
     num_nodes: int = cfg.NUM_SYNTHETIC_NODES
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
+    """python 
     Synthetic Topology Mapping
     ---------------------------
     Since the MachineLearningCSV variant omits Source/Destination IP columns,

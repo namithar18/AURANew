@@ -14,7 +14,7 @@ from pathlib import Path
 # ─────────────────────────────────────────────────────────────────────────────
 
 BASE_DIR   = Path(__file__).parent.resolve()
-CSV_DIR    = BASE_DIR / "CSV's" / "MachineLearningCVE"
+CSV_DIR = BASE_DIR / "dataset"
 MODELS_DIR = BASE_DIR / "saved_models"
 LOGS_DIR   = BASE_DIR / "logs"
 CONTRACTS_DIR = BASE_DIR / "contracts"
@@ -235,6 +235,31 @@ FEATURE_INDEX_MAP: dict = {
 # Raise MSE_THRESHOLD_HIGH to require stronger anomaly evidence for HIGH tier.
 MSE_THRESHOLD_HIGH   = 0.7   # MSE above this → AlertSeverity.HIGH
 MSE_THRESHOLD_MEDIUM = 0.4   # MSE above this → AlertSeverity.MEDIUM  (else LOW)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DASHBOARD UI CONSTANTS (Streamlit)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Freshness windows for dashboard file polls (seconds)
+# Reduced from 30s to speed up node state clearing
+PENDING_INJECT_FRESHNESS_SEC = 15       # Time window for pending_inject.json poll
+LAST_EXPLANATION_FRESHNESS_SEC = 20     # Time window for last_explanation.json
+
+# Node state display strings
+NODE_STATE_EVALUATING_SIMPLE = "Evaluating…"           # During EMA warmup
+NODE_STATE_EVALUATING_ICON = "⚡ Evaluating…"          # Custom injection with icon
+
+# Cache limits for session state
+MAX_ALERTS_CACHE = 30                   # Max alerts in Alert History
+MAX_INCIDENTS_CACHE = 20                # Max incidents in Response Actions
+
+# Custom injection analysis thresholds
+CUSTOM_INJECT_AE_THRESHOLD = 0.3        # AE reconstruction threshold for severity
+SCRIPT_PREVIEW_LENGTH = 300             # API injection script preview truncation
+
+# Reduce EMA warmup for faster threat escalation during demos
+# (Original: 50 batches ≈ 50 seconds; New: 20 batches ≈ 20 seconds)
+EMA_WARMUP_BATCHES = 20
 
 # Corruption profiles for each simulated attack type.
 # Each profile maps feature-group names to their corruption ranges:

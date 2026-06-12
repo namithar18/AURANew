@@ -303,7 +303,7 @@ def api_inject_custom():
         "node_label":    node_info.get("label", "Unknown"),
         "is_critical":   node_info.get("critical", False),
         "script_lines":  len(script.splitlines()),
-        "script_preview": script[:300] + ("…" if len(script) > 300 else ""),
+        "script_preview": script[:cfg.SCRIPT_PREVIEW_LENGTH] + ("…" if len(script) > cfg.SCRIPT_PREVIEW_LENGTH else ""),
         "severity":      "MEDIUM",
         "confidence":    0.0,
         "ae_score":      0.0,
