@@ -57,6 +57,7 @@ import io
 import json
 import logging
 import time
+import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -188,7 +189,7 @@ def _build_root_dataset(n_samples: int = cfg.FLTRUST_ROOT_SAMPLES) -> torch.Tens
 
     Shape: [n_samples, FEATURE_DIM]  on CPU.
     """
-    # Normal traffic clusters around 0.35–0.5 in MinMax-normalised CICIDS space
+    # Normal traffic clusters around 0.35–0.5 in MinMax-normalised NF-UNSW space
     data = torch.rand(n_samples, cfg.FEATURE_DIM) * 0.15 + 0.35
     return data
 
@@ -676,10 +677,11 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
 
     # Attack is tied to the bank org — only injected if bank is in active_orgs.
     # If bank is offline, all clients are honest (no meaningless FLTrust flag).
-    if "bank" in active_orgs:
-        attack_arg = active_orgs.index("bank")
+    if active_orgs:
+        attack_arg = random.randint(0, len(active_orgs) - 1)
+        print(f"[SERVER] 🎲 Randomly selected Byzantine client index: {attack_arg} ({active_orgs[attack_arg]})")
     else:
-        attack_arg = -1   # all honest
+        attack_arg = -1
 
     from aura.data_loader import CICIDSDataLoader
     _shared_loader = CICIDSDataLoader()
