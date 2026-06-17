@@ -60,7 +60,7 @@ LATENT_DIM      = 16    # Bottleneck: the latent fingerprint space
 DECODER_DIMS    = [24, 32]   # Mirror of encoder (symmetric reconstruction)
 
 AE_LEARNING_RATE = 1e-3
-AE_EPOCHS        = 30        # Enough for convergence on NF-UNSW-NB15-v3 subset
+AE_EPOCHS        = 50        # Full training run on NF-UNSW-NB15-v3 subset
 AE_BATCH_SIZE    = 256
 
 # Contrastive negative-sampling margin (pushes attack embeddings away from
@@ -77,7 +77,7 @@ GNN_INPUT_DIM  = FEATURE_DIM
 GNN_HIDDEN_DIM = 64
 GNN_OUTPUT_DIM = 32          # Latent node embedding dimension
 GNN_LEARNING_RATE = 5e-4
-GNN_EPOCHS     = 20
+GNN_EPOCHS     = 50
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DYNAMIC THRESHOLDING (Exponential Moving Average over batch MSE)
@@ -112,9 +112,10 @@ K_CONSECUTIVE_READINGS  = 5     # configurable
 # ─────────────────────────────────────────────────────────────────────────────
 
 FL_SERVER_ADDRESS   = "localhost:8080"
-FL_NUM_ROUNDS       = 3          # 3 rounds for 3 clients — 1 hash per round on ledger
-FL_MIN_CLIENTS      = 3          # Minimum clients needed to start a round
-FL_MIN_AVAILABLE    = 3          # All 3 orgs must be present before round 1
+FL_NUM_ROUNDS       = 3          # Federation rounds; final round hash is minted
+FL_MIN_CLIENTS      = 5          # All 5 org clients contribute each round
+FL_MIN_AVAILABLE    = 5          # All 5 orgs must be present before round 1
+FL_LOCAL_EPOCHS     = 50         # Local AE training epochs per client per FL round
 
 # Krum: number of clients to select per round (must be ≤ total clients - 2)
 # Krum drops the m clients whose weight updates are most distant from the median.

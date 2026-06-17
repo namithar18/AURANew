@@ -25,6 +25,7 @@ Returns
 
 import logging
 import os
+import hashlib as _hashlib
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Generator, List, Optional, Tuple
@@ -51,6 +52,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 DATASET_PATH = Path(__file__).parent.parent / "dataset" / "NF-UNSW-NB15-v3.csv"
 CSV_FILES: List[str] = [str(DATASET_PATH)]
+
+# Org name -> stable partition index for federated learning clients.
+_ORG_NAMES = ["hospital", "bank", "university", "isp", "retail"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper utilities
@@ -88,6 +92,18 @@ def _assign_real_nodes(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, int]:
     dst_nodes = df[dst_col].map(ip_to_id).values.astype(np.int64)
     
     return src_nodes, dst_nodes, len(unique_ips)
+
+
+def _ip_to_partition(ip: str, n_clients: int = len(_ORG_NAMES)) -> int:
+    """
+    Hash a source IP to a stable FL client bucket.
+
+    Keeping all flows from a host in one partition preserves local behaviour
+    better than random row splitting, which matters for each client's AE
+    baseline and any future per-client topology training.
+    """
+    h = int(_hashlib.md5(str(ip).encode()).hexdigest(), 16)
+    return h % n_clients
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -201,7 +217,7 @@ class CICIDSDataLoader:
         if pd.api.types.is_numeric_dtype(df[label_col]):
             benign_df = df[df[label_col] == cfg.BENIGN_LABEL]
         else:
-            benign_df = df[df[label_col].str.strip() == str(cfg.BENIGN_LABEL)]
+            benign_df = df[df[label_col].str.strip().str.upper() == "BENIGN"]
             
         logger.info(f"Benign training rows before sanitisation: {len(benign_df)}")
 
@@ -275,6 +291,104 @@ class CICIDSDataLoader:
 
                 label_tensor = torch.tensor(labels_w, dtype=torch.long)
                 yield graph_dict, label_tensor
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FL Client Partition Loader
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_client_partition(
+    client_id: str,
+    scaler: Optional[MinMaxScaler] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Load one FL client's benign NF-UNSW-NB15-v3 partition for AE training.
+
+    Rows are assigned by source-IP hash so each organisation gets a stable,
+    host-coherent, non-IID slice of the shared CSV. The returned tensors are
+    flat flow-feature matrices shaped [N, FEATURE_DIM], matching the current
+    Flower client training loop, which trains the autoencoder locally.
+    """
+    parts = client_id.split("_")
+    if len(parts) < 2:
+        raise ValueError(f"Cannot parse org key from client_id: '{client_id}'")
+
+    org_key = parts[1].lower()
+    if org_key not in _ORG_NAMES:
+        raise ValueError(
+            f"Unknown org '{org_key}'. Valid orgs: {_ORG_NAMES}. "
+            "Expected client_id format: 'org_<orgname>_<num>'."
+        )
+    partition_idx = _ORG_NAMES.index(org_key)
+
+    loader = CICIDSDataLoader()
+    if scaler is None:
+        logger.warning(
+            "[%s] No shared scaler provided; fitting a local scaler. "
+            "For FL runs, pass the shared scaler for comparable client updates.",
+            client_id,
+        )
+        scaler = loader.fit_scaler()
+
+    df = loader._load_csv(str(DATASET_PATH))
+    label_col = "Label" if "Label" in df.columns else cfg.LABEL_COL.strip()
+
+    if pd.api.types.is_numeric_dtype(df[label_col]):
+        benign_df = df[df[label_col] == cfg.BENIGN_LABEL].copy()
+    else:
+        benign_df = df[df[label_col].str.strip().str.upper() == "BENIGN"].copy()
+
+    src_col = "IPV4_SRC_ADDR" if "IPV4_SRC_ADDR" in benign_df.columns else "src_ip"
+    if src_col not in benign_df.columns:
+        raise ValueError(
+            f"Source IP column not found. Expected 'IPV4_SRC_ADDR' or 'src_ip'. "
+            f"Available columns: {list(benign_df.columns)}"
+        )
+
+    partitions = benign_df[src_col].apply(
+        lambda ip: _ip_to_partition(str(ip), n_clients=len(_ORG_NAMES))
+    )
+    partition_df = benign_df[partitions == partition_idx].copy()
+
+    if partition_df.empty:
+        raise RuntimeError(
+            f"[{client_id}] Partition {partition_idx} ({org_key}) has no benign "
+            "rows. Try increasing cfg.DATA_LOAD_FRACTION."
+        )
+
+    feature_cols = loader._feature_cols
+    if not feature_cols:
+        raise RuntimeError("Feature columns were not discovered while loading the dataset.")
+
+    X = partition_df[feature_cols].values.astype(np.float32)
+    X = scaler.transform(X).clip(0, 1)
+
+    if len(X) < 2:
+        raise RuntimeError(
+            f"[{client_id}] Partition {partition_idx} ({org_key}) has only "
+            f"{len(X)} row(s), not enough for train/validation split."
+        )
+
+    rng = np.random.default_rng(seed=42 + partition_idx)
+    rng.shuffle(X)
+
+    split = max(1, int(len(X) * 0.8))
+    if split >= len(X):
+        split = len(X) - 1
+
+    X_train = torch.tensor(X[:split], dtype=torch.float32)
+    X_val = torch.tensor(X[split:], dtype=torch.float32)
+
+    logger.info(
+        "[%s] Partition %d (%s) ready: train=%d val=%d features=%d",
+        client_id,
+        partition_idx,
+        org_key,
+        len(X_train),
+        len(X_val),
+        X_train.shape[1],
+    )
+    return X_train, X_val
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI Sanity Check
