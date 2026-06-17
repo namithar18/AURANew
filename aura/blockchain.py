@@ -158,16 +158,16 @@ class AURABlockchainLogger:
                 )
                 self._mode = "blockchain"
                 logger.info(f"Blockchain mode active.  Contract: {checksum_addr}")
-                print(f"[BLOCKCHAIN] Connected to Ganache at {ganache_url}")
-                print(f"[BLOCKCHAIN] Contract: {checksum_addr}")
+                logger.info(f"[BLOCKCHAIN] Connected to Ganache at {ganache_url}")
+                logger.info(f"[BLOCKCHAIN] Contract: {checksum_addr}")
 
         except Exception as e:
             logger.warning(
                 f"Ganache unavailable ({e}).  "
-                f"Switching to local-fallback mode — demo continues normally."
+                f"Switching to local-fallback mode - demo continues normally."
             )
             self._mode = "local_fallback"
-            print(f"[BLOCKCHAIN] Ganache offline → LOCAL FALLBACK mode active.")
+            logger.info("[BLOCKCHAIN] Ganache offline -> LOCAL FALLBACK mode active.")
 
     def _load_or_mock_deploy(self, contract_address: Optional[str]) -> Optional[str]:
         """
