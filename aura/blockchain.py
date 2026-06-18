@@ -368,4 +368,4 @@ if __name__ == "__main__":
         bad,   _   = bc.verify_model(f"v1.{i}", tampered_hash)
         print(f"  v1.{i}  correct={valid}  tampered={bad}  (source={src})")
 
-    print("\n✓ Blockchain module test passed.")
+    print("\n[PASS] Blockchain module test passed.")

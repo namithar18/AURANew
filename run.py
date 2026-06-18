@@ -48,7 +48,7 @@ def cmd_dashboard():
             capture_output=True,
         )
 
-    print("\n🛡️  Launching AURA Dashboard (React + Vite) …")
+    print("\n[!] Launching AURA Dashboard (React + Vite) ...")
     print("   API:  http://localhost:5001")
     print("   UI:   http://localhost:5173\n")
 
@@ -101,7 +101,7 @@ def cmd_test():
         if name == "FL Client":
             args.append("--help")
         result = subprocess.run(args, capture_output=True, text=True)
-        status = "✓ PASS" if result.returncode == 0 else "✗ FAIL"
+        status = "[PASS]" if result.returncode == 0 else "[FAIL]"
         color  = "\033[92m" if result.returncode == 0 else "\033[91m"
         print(f"  {color}{status}\033[0m  {name}")
         if result.returncode != 0:

@@ -456,7 +456,7 @@ if __name__ == "__main__":
     ae = FlowAutoencoder()
     x_flows = torch.randn(E, num_feats)     # E flow feature vectors
     x_hat, z = ae(x_flows)
-    print(f"Autoencoder  |  input {x_flows.shape} → latent {z.shape} → recon {x_hat.shape}")
+    print(f"Autoencoder  |  input {x_flows.shape} -> latent {z.shape} -> recon {x_hat.shape}")
 
     loss = ae.reconstruction_loss(x_flows, x_hat, z)
     print(f"  MSE loss (normal): {loss.item():.6f}")
@@ -471,11 +471,11 @@ if __name__ == "__main__":
     # ── STGNN ─────────────────────────────────────────────────────────────────
     gnn = AuraSTGNN()
     node_scores, embeds = gnn(x, edge_index)
-    print(f"\nSTGNN (GraphSAGE)  |  x {x.shape} → scores {node_scores.shape}  embeds {embeds.shape}")
+    print(f"\nSTGNN (GraphSAGE)  |  x {x.shape} -> scores {node_scores.shape}  embeds {embeds.shape}")
     print(f"  Node anomaly scores: min={node_scores.min():.4f}  max={node_scores.max():.4f}")
 
     # ── Bundle ────────────────────────────────────────────────────────────────
     bundle = AURAModelBundle()
     print(f"\nAURAModelBundle total params: {bundle.total_params():,}")
 
-    print("\n✓ Model tests passed.")
+    print("\n[PASS] Model tests passed.")

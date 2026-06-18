@@ -493,4 +493,4 @@ if __name__ == "__main__":
               f"mean={ea.mean():.4f}  max={ea.max():.4f}  "
               f"attacked={g['n_attacked_edges']}")
 
-    print("\n✓ Attack injector test passed.")
+    print("\n[PASS] Attack injector test passed.")
