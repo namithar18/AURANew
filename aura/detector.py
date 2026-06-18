@@ -588,4 +588,4 @@ if __name__ == "__main__":
                   f"conf={event.confidence:.2%}")
 
     print("\nEMA state:", eng.ema_state)
-    print("✓ Detector test passed.")
+    print("[PASS] Detector test passed.")
