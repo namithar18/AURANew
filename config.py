@@ -1,9 +1,15 @@
 """
 config.py — AURA Global Configuration
 ======================================
-Single source of truth for all hyperparameters, paths, and system constants.
-Centralising config prevents magic numbers from scattering across modules and
-makes hackathon tuning fast (one file to change).
+Single source of truth for ALL hyperparameters, paths, and system constants.
+Centralising config prevents magic numbers from scattering across modules.
+
+Research-grade design goals
+---------------------------
+  * Zero hardcoded values in any other module — every tunable lives here.
+  * Synthetic fallbacks documented inline so paper reviewers can reproduce
+    results with or without the full NF-UNSW-NB15-v3 dataset.
+  * All paths constructed relative to BASE_DIR so the project is portable.
 """
 
 import os
@@ -115,7 +121,7 @@ FL_SERVER_ADDRESS   = "localhost:8080"
 FL_NUM_ROUNDS       = 3          # Federation rounds; final round hash is minted
 FL_MIN_CLIENTS      = 5          # All 5 org clients contribute each round
 FL_MIN_AVAILABLE    = 5          # All 5 orgs must be present before round 1
-FL_LOCAL_EPOCHS     = 50         # Local AE training epochs per client per FL round
+FL_LOCAL_EPOCHS     = 3          # Local AE training epochs per client per FL round (reduced for fast simulation)
 
 # Krum: number of clients to select per round (must be ≤ total clients - 2)
 # Krum drops the m clients whose weight updates are most distant from the median.
@@ -123,6 +129,17 @@ KRUM_NUM_TO_SELECT  = 2          # Select 2 from 3 mock clients (drops 1 straggl
 
 # Straggler policy: if a client doesn't respond within this many seconds, drop it
 FL_ROUND_TIMEOUT_SEC = 30
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FLTRUST ROOT DATASET SOURCE
+# ─────────────────────────────────────────────────────────────────────────────
+
+# "real"      → load a benign partition from NF-UNSW-NB15-v3 as the server's
+#               trusted root dataset (best accuracy — recommended for paper).
+# "synthetic" → fall back to Gaussian samples when the dataset is unavailable.
+# The server always falls back to synthetic if the real load fails, so this is
+# a soft preference, not a hard requirement.
+FL_ROOT_DATA_SOURCE = "real"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FLTRUST AGGREGATION (replaces Krum — Upgrade 6)
@@ -154,6 +171,21 @@ CRITICAL_ALLOWLIST = {
     "node_1":  "Core HR Database",
     "node_2":  "Payment Gateway",
     "node_3":  "SCADA / ICS Controller",
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ORGANISATION NETWORK MAP (canonical — referenced by fl_server, client_state)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Maps org key → simulated LAN CIDR for all 5 federation clients.
+# Used by the FL simulation console and client-state display.
+# Must stay consistent with client_state.ALL_CLIENTS.
+ORG_NETWORK_MAP: dict = {
+    "hospital":   "192.168.1.0/24",
+    "bank":       "10.0.1.0/24",
+    "university": "172.16.1.0/24",
+    "isp":        "10.10.0.0/24",
+    "retail":     "172.31.0.0/24",
 }
 
 # Confidence thresholds for the 3-tier response policy
@@ -188,6 +220,43 @@ IF_CONTAMINATION = 0.02   # 2 % — removes extreme statistical outliers
 DASHBOARD_REFRESH_INTERVAL_MS = 1500   # Streamlit auto-refresh period
 ALERT_LOG_FILE = str(LOGS_DIR / "aura_alerts.jsonl")
 EVENT_LOG_FILE = str(LOGS_DIR / "aura_events.jsonl")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API SECURITY BLOCKLIST (custom injection endpoint)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Patterns that, if found in a user-submitted injection script, cause the
+# request to be rejected with HTTP 400.  Extend this list for production.
+# This centralises the filter so it is easily auditable and not buried in
+# api_server.py business logic.
+SECURITY_BLOCKLIST: list = [
+    "os.system",
+    "os.popen",
+    "subprocess",
+    "import os",
+    "import sys",
+    "import subprocess",
+    "__import__",
+    "exec(",
+    "eval(",
+    "open(",
+    "socket",
+    "shutil",
+    "pathlib",
+    "requests",
+    "urllib",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MITM SIMULATION PARAMETERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Standard deviation of the Gaussian noise injected into model weights during
+# a simulated Man-in-the-Middle attack.  A small value is sufficient to change
+# the SHA-256 hash (even 1-bit flip is detected) while remaining numerically
+# similar enough to be a plausible interception scenario.
+# Range: 0.001–0.05  |  Lower = subtler tampering, harder to detect by eye.
+MITM_NOISE_STD: float = 0.01
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CUSTOM INJECTION CONFIGURATION
