@@ -126,7 +126,10 @@ class FLDashboardService:
                         trusted = r.get("fltrust_trusted_indices", [])
                         scores = r.get("trust_scores", {})
                         self.fltrust_scores_hist.append({"round": rnd, "scores": scores})
-                        self.fl_log.append(f"Round {rnd}: FLTrust trusted {len(trusted)}/5 clients")
+                        n_total = len(ORGS)
+                        self.fl_log.append(
+                            f"Round {rnd}: FLTrust trusted {len(trusted)}/{n_total} clients"
+                        )
                         self.fl_log.append(f"Hash minted: {h[:24]}…")
                         self.hash_ledger.insert(0, {
                             "version": version,

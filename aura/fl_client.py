@@ -122,10 +122,15 @@ def _tamper_weights(arrays: List[np.ndarray]) -> List[np.ndarray]:
     Simulate a Man-in-the-Middle attack by injecting small perturbations
     into the received global weights.  This causes the SHA-256 hash to
     change, triggering the client's rejection logic.
+
+    Noise scale is governed by cfg.MITM_NOISE_STD (default 0.01) so the
+    simulation realism can be tuned from config.py without touching this code.
+    A small std is sufficient to flip the SHA-256 (even a 1-bit weight change
+    is detected) while keeping the tampered weights visually plausible.
     """
     tampered = []
     for arr in arrays:
-        noise = np.random.normal(0, 0.01, arr.shape).astype(np.float32)
+        noise = np.random.normal(0, cfg.MITM_NOISE_STD, arr.shape).astype(np.float32)
         tampered.append(arr + noise)
     return tampered
 
@@ -339,11 +344,15 @@ class AURAFlowerClient(fl.client.Client):
             f"epochs={self.local_epochs}"
         )
 
+        # Encode client identity as a stable integer for multi-client tracking.
+        # Using a hash of the string ID avoids collisions while keeping it int.
+        import hashlib as _hl
+        client_id_int = int(_hl.md5(self.client_id.encode()).hexdigest(), 16) % (2**31)
         return FitRes(
             status     = Status(code=Code.OK, message="OK"),
             parameters = ndarrays_to_parameters(updated_arrays),
             num_examples = num_examples,
-            metrics    = {"train_loss": float(train_loss), "client_id": 0},
+            metrics    = {"train_loss": float(train_loss), "client_id": client_id_int},
         )
 
     def evaluate(self, ins: EvaluateIns) -> EvaluateRes:
@@ -492,9 +501,12 @@ def create_mock_clients(
             if len(val_data) > (n_samples // 5):
                 val_data = val_data[:(n_samples // 5)]
         except (FileNotFoundError, RuntimeError, ValueError) as e:
-            logger.warning(f"[{client_id}] Falling back to synthetic data: {e}")
-            train_data = torch.rand(n_samples, feature_dim) * 0.3 + 0.35
-            val_data   = torch.rand(n_samples // 5, feature_dim) * 0.3 + 0.35
+            logger.warning(f"[{client_id}] Falling back to realistic benign profile: {e}")
+            from aura.attack_injector import _benign_profile
+            _train_np  = _benign_profile(n_samples, feature_dim)
+            _val_np    = _benign_profile(max(1, n_samples // 5), feature_dim)
+            train_data = torch.tensor(_train_np, dtype=torch.float32)
+            val_data   = torch.tensor(_val_np,   dtype=torch.float32)
 
         if i == attack_client:
             # Strong poisoning: 80% of samples with extreme values across ALL
@@ -546,18 +558,52 @@ def start_client(
 
     feature_dim = cfg.FEATURE_DIM
 
-    # ── Simulate each org's local network traffic distribution ──────────────
-    train_data = torch.rand(n_samples, feature_dim) * 0.3 + 0.35
-    val_data   = torch.rand(n_samples // 5, feature_dim) * 0.3 + 0.35
+    # ── Load real CICIDS partition for this org (mirrors create_mock_clients) ──
+    # Attempting to derive an org key from client_id (e.g. "org_hospital_1" → "hospital").
+    # Falls back to _benign_profile() if the dataset is unavailable.
+    _org_key = client_id.split("_")[1] if "_" in client_id else client_id
+    train_data: torch.Tensor
+    val_data:   torch.Tensor
+    try:
+        from aura.data_loader import load_client_partition, CICIDSDataLoader
+        _loader = CICIDSDataLoader()
+        _shared_scaler = _loader.fit_scaler()
+        train_data, val_data = load_client_partition(
+            client_id=client_id,
+            scaler=_shared_scaler,
+        )
+        # Cap to requested sample count to bound memory / run time
+        if len(train_data) > n_samples:
+            train_data = train_data[:n_samples]
+        if len(val_data) > max(1, n_samples // 5):
+            val_data = val_data[:n_samples // 5]
+        logger.info(f"[{client_id}] Loaded real CICIDS partition: "
+                    f"train={len(train_data)}  val={len(val_data)}")
+    except Exception as _e:
+        logger.warning(f"[{client_id}] Real partition unavailable ({_e}). "
+                       "Falling back to realistic benign profile.")
+        from aura.attack_injector import _benign_profile
+        _train_np = _benign_profile(n_samples, feature_dim)
+        _val_np   = _benign_profile(max(1, n_samples // 5), feature_dim)
+        train_data = torch.tensor(_train_np, dtype=torch.float32)
+        val_data   = torch.tensor(_val_np,   dtype=torch.float32)
 
     if is_byzantine:
-        # Adversarial client: poisoned data with extreme feature values
-        n_attack = n_samples // 5
-        attack_rows = torch.rand(n_attack, feature_dim)
-        attack_rows[:, [2, 3, 6]] = torch.rand(n_attack, 3) * 0.3 + 0.7   # in_bytes, in_pkts, tcp_flags
-        attack_rows[:, [4, 5, 9]] = torch.rand(n_attack, 3) * 0.2 + 0.8   # out_bytes, out_pkts, flow_dur
+        # Adversarial client: apply DDoS corruption profile from config so the
+        # poisoned feature pattern is consistent with AttackInjector and the
+        # AE explainer's training distribution — gives FLTrust a genuine signal.
+        n_attack    = min(len(train_data), n_samples // 5)
+        ddos_profile = cfg.ATTACK_CORRUPTION_PROFILES.get("ddos", {})
+        feat_map     = cfg.FEATURE_INDEX_MAP
+        attack_rows  = torch.rand(n_attack, feature_dim)
+        # Apply every feature range from the DDoS corruption profile
+        for feat_name, (lo, hi) in ddos_profile.items():
+            idx = feat_map.get(feat_name)
+            if idx is not None and idx < feature_dim:
+                attack_rows[:, idx] = torch.FloatTensor(n_attack).uniform_(lo, hi)
         train_data[:n_attack] = attack_rows
-        logger.info(f"[{client_id}] Byzantine mode — poisoned data injected.")
+        logger.info(f"[{client_id}] Byzantine mode — DDoS corruption profile applied "
+                    f"to {n_attack}/{len(train_data)} samples.")
     client = AURAFlowerClient(client_id, train_data, val_data)
 
     print(f"\n[{client_id}] Connecting to FL server at {server_address} …")

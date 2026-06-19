@@ -368,7 +368,15 @@ class ClientStateStore:
 
     def get_client_state(self, client_key: str) -> dict:
         with self._rlock:
-            cs = self.states.get(client_key) or self.states["hospital"]
+            if client_key not in self.states:
+                # Return an explicit error dict so the frontend surfaces the
+                # problem rather than silently showing the wrong client's data.
+                return {
+                    "error": f"Unknown client '{client_key}'. "
+                             f"Valid keys: {list(ALL_CLIENTS.keys())}",
+                    "client_key": client_key,
+                }
+            cs = self.states[client_key]
             return cs.to_dict()
 
     def get_all_clients_summary(self) -> List[dict]:

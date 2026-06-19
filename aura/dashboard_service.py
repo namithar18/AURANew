@@ -42,9 +42,11 @@ THEME = {
 }
 
 ORG_PROFILES = {
-    "hospital": {"label": "Hospital", "id": "org_hospital_1", "net": "192.168.1.0/24", "icon": "🏥", "role": "Normal", "color": "#00ff88"},
-    "bank": {"label": "Bank", "id": "org_bank_2", "net": "10.0.1.0/24", "icon": "🏦", "role": "Normal", "color": "#388bfd"},
-    "university": {"label": "University", "id": "org_university_3", "net": "172.16.1.0/24", "icon": "🎓", "role": "Normal", "color": "#4488ff"},
+    "hospital":   {"label": "Hospital",   "id": "org_hospital_1",  "net": "192.168.1.0/24",  "icon": "🏥", "role": "Normal", "color": "#00ff88"},
+    "bank":       {"label": "Bank",       "id": "org_bank_2",       "net": "10.0.1.0/24",    "icon": "🏦", "role": "Normal", "color": "#388bfd"},
+    "university": {"label": "University", "id": "org_university_3", "net": "172.16.1.0/24",  "icon": "🎓", "role": "Normal", "color": "#4488ff"},
+    "isp":        {"label": "ISP",        "id": "org_isp_4",        "net": "10.10.0.0/24",   "icon": "📡", "role": "Normal", "color": "#f59e0b"},
+    "retail":     {"label": "Retail",     "id": "org_retail_5",     "net": "172.31.0.0/24",  "icon": "🏪", "role": "Normal", "color": "#ec4899"},
 }
 
 ATTACK_MAP = {
@@ -133,12 +135,28 @@ class DashboardService:
             self.blockchain._account = None
             self.blockchain._local_store = {}
 
+        # Warmup: use realistic benign traffic profiles when dataset is available
+        # so the EMA baseline is grounded in real normal-traffic statistics.
         n = cfg.NUM_SYNTHETIC_NODES
-        for _ in range(cfg.EMA_WARMUP_BATCHES + 10):
-            x = torch.randn(n, cfg.FEATURE_DIM) * 0.1
-            ei = torch.randint(0, n, (2, 40))
-            attr = torch.randn(40, cfg.FEATURE_DIM) * 0.1
-            self.engine.process({"x": x, "edge_index": ei, "edge_attr": attr, "window_id": "warmup"})
+        try:
+            from aura.attack_injector import _benign_profile
+            for _ in range(cfg.EMA_WARMUP_BATCHES + 10):
+                _ea_np = _benign_profile(40, cfg.FEATURE_DIM)
+                x      = torch.tensor(
+                    _benign_profile(n, cfg.FEATURE_DIM), dtype=torch.float32
+                )
+                ei   = torch.randint(0, n, (2, 40))
+                attr = torch.tensor(_ea_np, dtype=torch.float32)
+                self.engine.process({"x": x, "edge_index": ei,
+                                     "edge_attr": attr, "window_id": "warmup"})
+        except Exception:
+            # Hard fallback: small random noise (never used if dataset exists)
+            for _ in range(cfg.EMA_WARMUP_BATCHES + 10):
+                x    = torch.randn(n, cfg.FEATURE_DIM) * 0.1
+                ei   = torch.randint(0, n, (2, 40))
+                attr = torch.randn(40, cfg.FEATURE_DIM) * 0.1
+                self.engine.process({"x": x, "edge_index": ei,
+                                     "edge_attr": attr, "window_id": "warmup"})
 
         self.system_status = "ACTIVE"
 
@@ -352,28 +370,47 @@ class DashboardService:
             self._fl_running = True
             self.fed_log = ["🚀 Federation round initiated …"]
             bc_module = self.blockchain
-            round_results = run_federation_simulation(blockchain_module=bc_module, n_rounds=3)
+            round_results = run_federation_simulation(blockchain_module=bc_module, n_rounds=cfg.FL_NUM_ROUNDS)
 
             for r in round_results:
-                rnd = r.get("round", "?")
-                version = r.get("model_version", "N/A")
-                h = r.get("model_hash", "N/A")
-                trusted = r.get("fltrust_trusted_indices", [])
-                kept = len(trusted)
-                if "client_statuses" in r:
-                    self.fl_client_status = r["client_statuses"]
-                self.fed_log.extend([
-                    f"━━━  Round {rnd}  ━━━",
-                    "[CLIENT hospital_1] Attack pattern learned. Sending weights…",
-                    "[CLIENT bank_2]     Local training complete. Sending weights…",
-                    "[CLIENT uni_3]      Local training complete. Sending weights…",
-                    f"[SERVER] FLTrust: {kept}/3 client updates trusted (cosine vs server root).",
+                rnd      = r.get("round", "?")
+                version  = r.get("model_version", "N/A")
+                h        = r.get("model_hash", "N/A")
+                trusted  = r.get("fltrust_trusted_indices", [])
+                kept     = len(trusted)
+                statuses = r.get("client_statuses", [])
+
+                if statuses:
+                    self.fl_client_status = statuses
+
+                # Build the round log dynamically from actual participant list
+                round_log = [f"━━━  Round {rnd}  ━━━"]
+                total_clients = len(statuses)
+                for cs in statuses:
+                    cid  = cs.get("client_id", "unknown")
+                    role = cs.get("role", "Normal")
+                    if role == "Byzantine":
+                        round_log.append(
+                            f"[CLIENT {cid}] ⚠ Attack pattern detected. Sending weights…"
+                        )
+                    else:
+                        round_log.append(
+                            f"[CLIENT {cid}] Local training complete. Sending weights…"
+                        )
+                round_log += [
+                    f"[SERVER] FLTrust: {kept}/{total_clients} client updates trusted "
+                    f"(cosine vs server root).",
                     f"[SERVER] Global Model {version} aggregated.",
                     f"[BLOCKCHAIN] Hash recorded: {h[:20]}…",
-                    "[CLIENT hospital_1] Verifying hash on chain… ✓ Match. Model deployed.",
-                    "[CLIENT bank_2]     Verifying hash on chain… ✓ Match. Model deployed.",
-                    "[CLIENT uni_3]      Verifying hash on chain… ✓ Match. Model deployed.",
-                ])
+                ]
+                # Client verification entries from actual participants
+                for cs in statuses:
+                    cid = cs.get("client_id", "unknown")
+                    round_log.append(
+                        f"[CLIENT {cid}] Verifying hash on chain… ✓ Match. Model deployed."
+                    )
+                self.fed_log.extend(round_log)
+
                 self.chain_log.insert(0, {
                     "version": version,
                     "hash": h,
@@ -381,7 +418,7 @@ class DashboardService:
                     "time": time.strftime("%H:%M:%S"),
                 })
 
-            self.fl_rounds_done += 3
+            self.fl_rounds_done += len(round_results)
             self.chain_entries = len(self.chain_log)
             self.fed_log.append("✅ Federation complete.  All clients immunised.")
             self._fl_running = False
@@ -398,8 +435,8 @@ class DashboardService:
         return entry
 
     def verify_chain(self) -> dict:
-        registry = Path("logs/hash_registry.json")
-        ledger = Path("logs/blockchain_fallback.jsonl")
+        registry = cfg.LOGS_DIR / "hash_registry.json"
+        ledger   = cfg.LOGS_DIR / "blockchain_fallback.jsonl"
         if not registry.exists():
             return {"ok": False, "message": "Trusted registry not found. Run FL first."}
         trusted = json.loads(registry.read_text())

@@ -69,43 +69,31 @@ PYTHON    = sys.executable
 SERVER_PY = ROOT / "aura" / "fl_server.py"
 CLIENT_PY = ROOT / "aura" / "fl_client.py"
 
-# ── Organisation definitions ──────────────────────────────────────────────────
+sys.path.insert(0, str(ROOT))
+import config as cfg
+
+# ── Organisation definitions — built from cfg.ORG_NETWORK_MAP ────────────────
+# CIDRs live in a single source of truth (config.py) so adding a new org
+# only requires editing the map there, not hunting through this file.
+_ORG_DEFS = [
+    {"client_id": "org_hospital_1",   "key": "hospital",   "samples": 500,
+     "description": "Hospital Network — normal traffic"},
+    {"client_id": "org_bank_2",       "key": "bank",       "samples": 500,
+     "description": "Bank Network — may be randomly assigned Byzantine"},
+    {"client_id": "org_university_3", "key": "university", "samples": 500,
+     "description": "University Network — normal traffic"},
+    {"client_id": "org_isp_4",        "key": "isp",        "samples": 500,
+     "description": "ISP Network — normal traffic"},
+    {"client_id": "org_retail_5",     "key": "retail",     "samples": 500,
+     "description": "Retail Network — normal traffic"},
+]
 ORGS = [
     {
-        "client_id":    "org_hospital_1",
-        "network_sim":  "192.168.1.0/24",
-        "byzantine":    False,
-        "samples":      500,
-        "description":  "Hospital Network — normal traffic",
-    },
-    {
-        "client_id":    "org_bank_2",
-        "network_sim":  "10.0.1.0/24",
-        "byzantine":    False,
-        "samples":      500,
-        "description":  "Bank Network — ADVERSARIAL (Byzantine poisoning attempt)",
-    },
-    {
-        "client_id":    "org_university_3",
-        "network_sim":  "172.16.1.0/24",
-        "byzantine":    False,
-        "samples":      500,
-        "description":  "University Network — normal traffic",
-    },
-    {
-        "client_id":    "org_isp_4",
-        "network_sim":  "10.10.0.0/24",
-        "byzantine":    False,
-        "samples":      500,
-        "description":  "ISP Network — normal traffic",
-    },
-    {
-        "client_id":    "org_retail_5",
-        "network_sim":  "172.31.0.0/24",
-        "byzantine":    False,
-        "samples":      500,
-        "description":  "Retail Network — normal traffic",
-    },
+        **d,
+        "network_sim": cfg.ORG_NETWORK_MAP.get(d["key"], "10.0.0.0/24"),
+        "byzantine":   False,
+    }
+    for d in _ORG_DEFS
 ]
 
 
@@ -254,7 +242,8 @@ if __name__ == "__main__":
         help="gRPC server address (default: localhost:8080). "
              "For cross-machine: use the server's LAN IP, e.g. 192.168.0.10:8080"
     )
-    parser.add_argument("--rounds",      type=int, default=3)
+    parser.add_argument("--rounds",      type=int, default=cfg.FL_NUM_ROUNDS,
+                        help=f"Number of FL rounds (default: {cfg.FL_NUM_ROUNDS}, from cfg.FL_NUM_ROUNDS)")
     parser.add_argument("--server-only", action="store_true",
                         help="Start server and wait for remote clients (no local client procs)")
     args = parser.parse_args()

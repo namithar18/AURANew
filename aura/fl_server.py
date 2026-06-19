@@ -180,17 +180,60 @@ def krum_aggregate(
 
 def _build_root_dataset(n_samples: int = cfg.FLTRUST_ROOT_SAMPLES) -> torch.Tensor:
     """
-    Generate a synthetic root dataset of benign-looking NetFlow features.
+    Build the FLTrust server root dataset (trusted benign reference).
 
-    In a real deployment this would be a curated hold-out split of verified
-    benign traffic.  In the hackathon demo we generate Gaussian samples in
-    the same normalised range as Monday CSV benign traffic (mean ~0.4, low
-    variance) so the server gradient still points in the right direction.
+    Strategy (controlled by cfg.FL_ROOT_DATA_SOURCE):
+    -------------------------------------------------
+    "real" (default for research paper):
+      Loads a randomly selected benign partition from NF-UNSW-NB15-v3 via
+      data_loader.  This gives the server gradient a direction grounded in
+      the actual benign traffic manifold rather than a Gaussian approximation,
+      leading to higher cosine-similarity separation between honest and
+      Byzantine client updates.
 
-    Shape: [n_samples, FEATURE_DIM]  on CPU.
+    "synthetic" (fallback / dataset-unavailable):
+      Gaussian samples in the 0.35–0.50 range, matching the empirically
+      observed mean of Monday CSV benign traffic after MinMax scaling.
+
+    The function always falls back to synthetic if the real load raises any
+    exception, so it is safe to call even without the dataset present.
+
+    Shape: [n_samples, FEATURE_DIM] on CPU.
     """
-    # Normal traffic clusters around 0.35–0.5 in MinMax-normalised NF-UNSW space
+    if cfg.FL_ROOT_DATA_SOURCE == "real":
+        try:
+            import random as _random
+            from aura.data_loader import load_client_partition, CICIDSDataLoader
+            # Pick a random org partition to avoid the server always using the
+            # same subset (avoids an implicit bias towards one organisation).
+            _orgs = ["hospital", "bank", "university", "isp", "retail"]
+            _org  = _random.choice(_orgs)
+            _cid  = f"org_{_org}_{_orgs.index(_org) + 1}"
+            _loader = CICIDSDataLoader()
+            _scaler = _loader.fit_scaler()
+            _train, _ = load_client_partition(client_id=_cid, scaler=_scaler)
+            # Sub-sample to exactly n_samples (or all if fewer available)
+            if len(_train) >= n_samples:
+                idxs = torch.randperm(len(_train))[:n_samples]
+                root = _train[idxs]
+            else:
+                # Tile if the partition is smaller than requested
+                repeats = (n_samples // len(_train)) + 1
+                root = _train.repeat(repeats, 1)[:n_samples]
+            logger.info(
+                f"[FLTrust] Root dataset loaded from real partition "
+                f"'{_cid}' ({len(root)} samples)."
+            )
+            return root
+        except Exception as _e:
+            logger.warning(
+                f"[FLTrust] Real root dataset unavailable ({_e}). "
+                "Falling back to synthetic Gaussian root."
+            )
+    # Synthetic fallback: Gaussian samples centred in the normal traffic range.
+    # Normal traffic clusters around 0.35–0.50 in MinMax-normalised NF-UNSW space.
     data = torch.rand(n_samples, cfg.FEATURE_DIM) * 0.15 + 0.35
+    logger.info(f"[FLTrust] Synthetic Gaussian root dataset generated ({n_samples} samples).")
     return data
 
 
@@ -736,16 +779,11 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
         for i, client in enumerate(clients):
             is_selected  = (selected_idx and i in selected_idx)
             is_byzantine = (i in dropped_idx)   # FLTrust-flagged = suspicious
-            org_key      = active_orgs[i] if i < len(active_orgs) else f"org_{i}"
-            net_map      = {"hospital": "192.168.1.0/24",
-                            "bank": "10.0.1.0/24",
-                            "university": "172.16.1.0/24",
-                            "isp": "10.10.0.0/24",
-                            "retail": "172.31.0.0/24"}
+            org_key = active_orgs[i] if i < len(active_orgs) else f"org_{i}"
             client_statuses.append({
                 "client_id": client.client_id,
                 "org_id":    org_key,
-                "network":   net_map.get(org_key, "—"),
+                "network":   cfg.ORG_NETWORK_MAP.get(org_key, "—"),
                 "org":       org_key.capitalize(),
                 "role":      "Byzantine" if is_byzantine else "Normal",
                 "selected":  is_selected if selected_idx else (not is_byzantine),

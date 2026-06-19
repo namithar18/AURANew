@@ -583,10 +583,11 @@ def _render_clients(card_phs):
         elif vfy is False:
             vfy_html = f"<div style='color:{_vfy_red}; font-size:0.8em'>&#9939; Hash MISMATCH &#10007;</div>"
 
+        _org_icon = _ORG_ICONS.get(org_key, "🏢")
         card_phs[i].markdown(
             f"<div class='client-card {css}'>"
             f"<div style='font-size:1.0em; font-weight:bold; color:{THEME['cyan']}'>"
-            f"{['🏥','🏦','🎓'][i]} {org['label']}</div>"
+            f"{_org_icon} {org['label']}</div>"
             f"<div style='font-size:0.77em; color:{THEME['dim']}'>{org['id']}</div>"
             f"<div style='font-size:0.77em; color:{THEME['dim']}'>🌐 {org['net']}</div>"
             f"<div style='font-size:0.78em; color:{role_color}; margin-top:2px'>"
@@ -645,7 +646,8 @@ def _render_metrics(ph):
     c1.metric("Rounds Done",  f"{len(rr)} / {st.session_state['total_rounds']}")
     _nt = len(last.get("fltrust_trusted_indices", []))
     _nf = len(last.get("fltrust_flagged_indices", []))
-    c2.metric("FLTrust trusted", f"{_nt} / 3")
+    _n_active = len(st.session_state.get("active_orgs", _ORG_KEYS))
+    c2.metric("FLTrust trusted", f"{_nt} / {_n_active}")
     c3.metric("FLTrust flagged", str(_nf))
     status = "✅ Done" if st.session_state["fl_done"] else "🔄 Running"
     c4.metric("Status", status)
@@ -753,7 +755,7 @@ metrics_ph = st.empty()
 with metrics_ph.container():
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Rounds Done",   f"0 / {rnd_total}")
-    c2.metric("FLTrust trusted", "— / 3")
+    c2.metric("FLTrust trusted", f"— / {len(_ORG_KEYS)}")
     c3.metric("FLTrust flagged", "—")
     c4.metric("Status",        run_state)
 
