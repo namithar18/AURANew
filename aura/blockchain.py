@@ -194,21 +194,29 @@ class AURABlockchainLogger:
     def _inline_deploy(self) -> Optional[str]:
         """
         Deploy the ModelRegistry contract to Ganache using raw bytecode.
-        This avoids needing Truffle/Hardhat for the demo.
 
-        The bytecode below is the compiled output of contracts/ModelRegistry.sol
-        using solc 0.8.19 with optimization enabled.
+        Full blockchain mode requires the following one-time setup:
+        ----------------------------------------------------------
+        1. Install Ganache:  npm install -g ganache
+        2. Start a local chain:  ganache --port 7545 --deterministic
+        3. Install Truffle:  npm install -g truffle
+        4. From the project root:  cd contracts && truffle migrate --reset
+        5. Copy the deployed contract address into:
+               saved_models/contract_address.txt
+        6. Restart AURA — it will detect the address file and use blockchain mode.
+
+        Alternatively set GANACHE_URL in config.py to point to an existing chain.
+
+        This method intentionally raises NotImplementedError to force the caller
+        (_load_or_mock_deploy) into the file-based address path, which then
+        falls through to the local-fallback JSONL ledger automatically.
+        The research demo is fully functional in local-fallback mode.
         """
-        # Minimal bytecode for a contract that stores bytes32 hashes by string key.
-        # If solc isn't available, this is skipped and fallback is used.
-        BYTECODE = (
-            "0x608060405234801561001057600080fd5b50610415806100206000396000f3fe"
-            "608060405234801561001057600080fd5b50600436106100415760003560e01c80"
-            # (Placeholder - real bytecode from ModelRegistry.sol compilation)
+        raise NotImplementedError(
+            "Inline contract deployment is not supported. "
+            "Run `truffle migrate` and write the address to "
+            "saved_models/contract_address.txt, then restart AURA."
         )
-        # For the demo: skip actual deployment, use fallback
-        # In production: use web3.eth.contract(abi=..., bytecode=BYTECODE).constructor().transact()
-        raise NotImplementedError("Use Ganache CLI with pre-deployed contract for full blockchain mode.")
 
     # ------------------------------------------------------------------
     # Public Interface

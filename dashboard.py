@@ -375,8 +375,8 @@ def run_inference_tick(graph: dict, is_attack: bool = False):
 
         # Add alert to log
         st.session_state["alerts"].insert(0, event.to_dict())
-        if len(st.session_state["alerts"]) > 30:
-            st.session_state["alerts"] = st.session_state["alerts"][:30]
+        if len(st.session_state["alerts"]) > cfg.MAX_ALERTS_CACHE:
+            st.session_state["alerts"] = st.session_state["alerts"][:cfg.MAX_ALERTS_CACHE]
 
         # Store explanation for the live panel (overwrite with latest triggered event)
         if event.inferred_attack != "Normal" and event.top_features:
@@ -409,13 +409,7 @@ def run_inference_tick(graph: dict, is_attack: bool = False):
         # already see WHAT is anomalous, even before a formal alert fires.
         for nid in graph.get("attack_nodes", []):
             colors[nid] = THEME["yellow"]
-            states[nid] = "Evaluating…"
-
-        try:
-            from aura.ae_explainer import explain_ae, ATTACK_EXPLANATIONS
-            edge_attr = graph.get("edge_attr")
-            if edge_attr is not None:
-                feat_residuals = eng.ae.explain_features(edge_attr)
+            states[nid] = cfg.NODE_STATE_EVALUATING_SIMPLE
                 expl = explain_ae(feat_residuals)
                 st.session_state["last_explanation"] = {
                     "inferred_attack": expl["inferred_attack"],
@@ -577,10 +571,10 @@ if _pending_path.exists():
         _pi_ts  = float(_pi.get("timestamp", 0))
         _pi_nid = str(_pi.get("target_node", ""))
 
-        if _pi_idx >= 0 and _pi_ts > 0 and (time.time() - _pi_ts) < 30:
+        if _pi_idx >= 0 and _pi_ts > 0 and (time.time() - _pi_ts) < cfg.PENDING_INJECT_FRESHNESS_SEC:
             # ── Update topology: target node → yellow ──────────────────────
             st.session_state["node_colors"][_pi_idx] = THEME["yellow"]
-            st.session_state["node_states"][_pi_idx] = "⚡ Evaluating…"
+            st.session_state["node_states"][_pi_idx] = cfg.NODE_STATE_EVALUATING_ICON
 
             # ── Determine severity from MSE ────────────────────────────
             from aura.detector import AnomalyEvent, AlertSeverity
@@ -596,7 +590,7 @@ if _pending_path.exists():
                 timestamp       = _pi_ts,
                 window_id       = f"CUSTOM_INJECT_{_pi_nid}",
                 ae_score        = _pi_mse,
-                ae_threshold    = 0.3,
+                ae_threshold    = cfg.CUSTOM_INJECT_AE_THRESHOLD,
                 gnn_scores      = [],
                 severity        = _pi_sev,
                 triggered_nodes = [_pi_idx],
@@ -614,15 +608,15 @@ if _pending_path.exists():
                 _pi_records = st.session_state["responder"].act(_pi_event)
                 for _pr in _pi_records:
                     st.session_state["incidents"].insert(0, _pr.to_dict())
-                if len(st.session_state["incidents"]) > 20:
-                    st.session_state["incidents"] = st.session_state["incidents"][:20]
+                if len(st.session_state["incidents"]) > cfg.MAX_INCIDENTS_CACHE:
+                    st.session_state["incidents"] = st.session_state["incidents"][:cfg.MAX_INCIDENTS_CACHE]
 
             # ── Append to Alert History ─────────────────────────────────
             _pi_alert = _pi_event.to_dict()
             _pi_alert["tag"] = "CUSTOM_INJECT"
             st.session_state["alerts"].insert(0, _pi_alert)
-            if len(st.session_state["alerts"]) > 30:
-                st.session_state["alerts"] = st.session_state["alerts"][:30]
+            if len(st.session_state["alerts"]) > cfg.MAX_ALERTS_CACHE:
+                st.session_state["alerts"] = st.session_state["alerts"][:cfg.MAX_ALERTS_CACHE]
             st.session_state["total_attacks"] += 1
 
         # Consume-once: overwrite with empty so next cycle skips it
@@ -795,7 +789,7 @@ _inject_expl_data = {}
 if _expl_json_path.exists():
     try:
         _age = time.time() - _expl_json_path.stat().st_mtime
-        if _age < 30:
+        if _age < cfg.LAST_EXPLANATION_FRESHNESS_SEC:
             _inject_expl_data = json.loads(_expl_json_path.read_text())
             _show_inject_expl  = bool(_inject_expl_data.get("top_features"))
     except Exception:
