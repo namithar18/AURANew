@@ -367,34 +367,44 @@ FEATURE_INDEX_MAP: dict = {
 _CALIB_JSON_PATH = LOGS_DIR / "calibration_results.json"
 
 
-def load_ae_thresholds() -> tuple[float, float]:
+# Sentinel fallback used ONLY before calibration has ever been run (e.g. during
+# `calibrate_thresholds.py`'s own bootstrap, which needs to import config before
+# it can produce the JSON this function reads). These are NOT research-valid
+# thresholds — AE_THRESHOLDS_CALIBRATED tells the rest of the codebase whether
+# the values in use are real or sentinel.
+_SENTINEL_THRESHOLD_HIGH   = 0.05
+_SENTINEL_THRESHOLD_MEDIUM = 0.02
+
+
+def load_ae_thresholds() -> tuple[float, float, bool]:
     """
     Load MSE_THRESHOLD_HIGH and MSE_THRESHOLD_MEDIUM from calibration_results.json.
 
     Returns
     -------
-    (threshold_high, threshold_medium) derived from the benign MSE distribution.
-
-    Raises FileNotFoundError if calibration_results.json is missing, or ValueError
-    if the file cannot be parsed. This enforces that no hardcoded threshold values
-    are used in the research project.
+    (threshold_high, threshold_medium, calibrated) where `calibrated` is False
+    only when sentinel bootstrap values are returned because the calibration
+    file doesn't exist yet. Any code path that needs research-valid thresholds
+    (training, response engine, dashboards) should check this flag and refuse
+    to proceed on sentinel values rather than silently using them.
     """
     if not _CALIB_JSON_PATH.exists():
         msg = (
-            "[CONFIG] ❌ logs/calibration_results.json NOT FOUND. "
-            "Dynamic AE thresholds are required for this research project. "
-            "Run: `python calibrate_thresholds.py` to generate them."
+            "[CONFIG] ⚠️  logs/calibration_results.json NOT FOUND. "
+            "Falling back to SENTINEL AE thresholds so config.py can still be "
+            "imported (this is required for calibrate_thresholds.py to bootstrap "
+            "itself). These sentinel values are NOT valid for training, detection, "
+            "or the paper. Run: `python calibrate_thresholds.py --train-quick` "
+            "to generate real calibrated thresholds, then re-run your command."
         )
-        _cfg_log.error(msg)
-        raise FileNotFoundError(msg)
+        _cfg_log.warning(msg)
+        return _SENTINEL_THRESHOLD_HIGH, _SENTINEL_THRESHOLD_MEDIUM, False
 
     try:
         data = json.loads(_CALIB_JSON_PATH.read_text())
         high   = float(data["recommended_MSE_THRESHOLD_HIGH"])
         medium = float(data["recommended_MSE_THRESHOLD_MEDIUM"])
 
-        # Sanity-check the P90/P99 collapse issue documented in the paper.
-        # If the gap is < 0.002 the three-tier severity system collapses.
         p90 = data.get("p90", medium)
         p99 = data.get("p99", high)
         if abs(p99 - p90) < 0.002:
@@ -410,7 +420,7 @@ def load_ae_thresholds() -> tuple[float, float]:
             f"[CONFIG] AE thresholds loaded from calibration JSON — "
             f"HIGH={high:.6f}  MEDIUM={medium:.6f}"
         )
-        return high, medium
+        return high, medium, True
 
     except Exception as exc:
         msg = (
@@ -423,11 +433,10 @@ def load_ae_thresholds() -> tuple[float, float]:
 
 # Resolved at import time — every consumer (api_server, dashboard, dashboard_service)
 # picks up the calibrated value automatically once calibration_results.json exists.
-_ae_thresh_high, _ae_thresh_medium = load_ae_thresholds()
+_ae_thresh_high, _ae_thresh_medium, AE_THRESHOLDS_CALIBRATED = load_ae_thresholds()
 
 MSE_THRESHOLD_HIGH   = _ae_thresh_high    # EMA-UCL P99 of benign MSE distribution
 MSE_THRESHOLD_MEDIUM = _ae_thresh_medium  # EMA-UCL P90 of benign MSE distribution
-
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA-DRIVEN ATTACK CORRUPTION PROFILES
 # ─────────────────────────────────────────────────────────────────────────────

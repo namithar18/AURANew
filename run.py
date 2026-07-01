@@ -104,7 +104,16 @@ def cmd_test():
         args = [PYTHON, str(script)]
         if name == "FL Client":
             args.append("--help")
-        result = subprocess.run(args, capture_output=True, text=True)
+
+                try:
+            result = subprocess.run(args, capture_output=True, text=True, input="", timeout=60)
+                except subprocess.TimeoutExpired as e:
+                        result = subprocess.CompletedProcess(
+                                args,
+                                returncode=1,
+                                stdout=e.stdout or "",
+                                stderr=f"Timed out after 60s waiting for: {' '.join(args)}",
+                        )
         status = "[PASS]" if result.returncode == 0 else "[FAIL]"
         color  = "\033[92m" if result.returncode == 0 else "\033[91m"
         print(f"  {color}{status}\033[0m  {name}")

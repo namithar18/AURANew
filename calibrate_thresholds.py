@@ -138,7 +138,7 @@ def collect_normal_mse(ae: FlowAutoencoder) -> np.ndarray:
     windows_processed = 0
 
     log.info(f"Streaming benign windows from {DATASET_CSV} (max {MAX_CALIBRATION_WINDOWS}) …")
-    for graph, labels in loader.stream_graphs(scaler, csv_files=[DATASET_CSV]):
+    for graph, labels in loader.stream_graphs(scaler, csv_files=[cfg.CSV_DIR / DATASET_CSV]):
         # Only use edges labelled benign (label=0) — pure normal traffic
         edge_attr = graph["edge_attr"]    # [E, F]
         benign_mask = (labels == 0)
