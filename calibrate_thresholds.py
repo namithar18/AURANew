@@ -64,7 +64,7 @@ log = logging.getLogger("calibrate")
 # ── Constants ─────────────────────────────────────────────────────────────────
 AE_CHECKPOINT = cfg.MODELS_DIR / "autoencoder_best.pth"
 # The primary dataset for this project: NF-UNSW-NB15-v3
-DATASET_CSV   = "NF-UNSW-NB15-v3.csv"
+DATASET_CSV   = str(cfg.CSV_DIR / "NF-UNSW-NB15-v3.csv")
 
 # How many graph windows to sample for calibration (more = better estimate)
 MAX_CALIBRATION_WINDOWS = 200

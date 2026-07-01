@@ -52,7 +52,7 @@ LABEL_COL = "Label"
 BENIGN_LABEL = 0
 
 # Fraction of data to load per CSV (1.0 = all rows; reduce for speed during dev)
-DATA_LOAD_FRACTION = 0.3   # 30 % is enough to demo; use 1.0 for full training
+DATA_LOAD_FRACTION = 1.0   # 30 % is enough to demo; use 1.0 for full training
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GRAPH / TTL EDGE DECAY
@@ -105,7 +105,7 @@ EMA_ALPHA = 0.05
 EMA_SIGMA_MULTIPLIER = 1.5
 
 # Warm-up batches before thresholds are active (avoids cold-start false alarms)
-EMA_WARMUP_BATCHES = 50
+EMA_WARMUP_BATCHES = 5
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SEVERITY ENGINE — Temporal Accumulator + EMA Trajectory
@@ -166,7 +166,7 @@ FLTRUST_SERVER_LR      = 1e-3
 # Trust score at or below this value causes the client to be flagged as Byzantine
 # in the detection log (fed into Upgrade 3).  ReLU already zeroes negatives;
 # this threshold lets you also zero out near-zero trust scores from noisy clients.
-FLTRUST_MIN_TRUST_SCORE = 0.0   # 0.0 = ReLU only (strict); raise to e.g. 0.05 to be stricter
+FLTRUST_MIN_TRUST_SCORE = 0.05   # 0.0 = ReLU only (strict); raise to e.g. 0.05 to be stricter
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RESPONSE ENGINE — Critical Infrastructure Allowlist
@@ -380,6 +380,11 @@ def load_ae_thresholds() -> tuple[float, float]:
     are used in the research project.
     """
     if not _CALIB_JSON_PATH.exists():
+        import sys
+        if any("calibrate_thresholds" in arg for arg in sys.argv):
+            _cfg_log.warning("[CONFIG] calibration_results.json missing, but running calibration script. Using dummy thresholds to boot.")
+            return 0.7, 0.4
+            
         msg = (
             "[CONFIG] ❌ logs/calibration_results.json NOT FOUND. "
             "Dynamic AE thresholds are required for this research project. "
