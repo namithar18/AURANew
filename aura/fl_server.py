@@ -386,6 +386,37 @@ def hash_model_weights(arrays: List[np.ndarray]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Custom Flower Strategy: KrumOnlyStrategy (Pure Krum for Benchmarks)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class KrumOnlyStrategy(FedAvg):
+    """
+    Pure Krum aggregation — uses krum_select + krum_aggregate.
+    Separate from KrumFedAURA (which uses FLTrust).
+    Required for benchmark_byzantine.py to actually contrast
+    Krum vs FLTrust rather than running FLTrust twice.
+    """
+    def aggregate_fit(self, server_round, results, failures):
+        client_updates = [
+            parameters_to_ndarrays(fit_res.parameters)
+            for _, fit_res in results
+        ]
+        # Use existing krum_select and krum_aggregate functions
+        selected_indices = krum_select(client_updates, 
+                                       num_to_select=max(1, len(results) - 2))
+        selected_updates = [client_updates[i] for i in selected_indices]
+        dropped_indices  = [i for i in range(len(results)) 
+                           if i not in selected_indices]
+
+        aggregated = krum_aggregate(selected_updates)
+        return ndarrays_to_parameters(aggregated), {
+            "krum_selected_indices": selected_indices,
+            "krum_dropped_indices":  dropped_indices,
+            "fltrust_flagged_indices": dropped_indices,  # for benchmark compat
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Custom Flower Strategy: KrumFedAURA (FLTrust inside aggregate_fit; Krum helpers are legacy)
 # ─────────────────────────────────────────────────────────────────────────────
 

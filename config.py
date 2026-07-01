@@ -74,7 +74,8 @@ LATENT_DIM      = 16    # Bottleneck: the latent fingerprint space
 DECODER_DIMS    = [24, 32]   # Mirror of encoder (symmetric reconstruction)
 
 AE_LEARNING_RATE = 1e-3
-AE_EPOCHS        = 50        # Full training run on NF-UNSW-NB15-v3 subset
+AE_EPOCHS        = 50        # OFFLINE PRE-TRAINING ONLY — never used in FL rounds
+                             # Used by: train_ae.py initial standalone training
 AE_BATCH_SIZE    = 256
 
 # Contrastive negative-sampling margin (pushes attack embeddings away from
@@ -129,7 +130,9 @@ FL_SERVER_ADDRESS   = "localhost:8080"
 FL_NUM_ROUNDS       = 3          # Federation rounds; final round hash is minted
 FL_MIN_CLIENTS      = 5          # All 5 org clients contribute each round
 FL_MIN_AVAILABLE    = 5          # All 5 orgs must be present before round 1
-FL_LOCAL_EPOCHS     = 3          # Local AE training epochs per client per FL round (reduced for fast simulation)
+FL_LOCAL_EPOCHS     = 1          # One pass over healthy_buffer per FL round
+                                 # Multiple passes risk overfitting to one time window
+                                 # and work against concept drift prevention
 
 # Krum: number of clients to select per round (must be ≤ total clients - 2)
 # Krum drops the m clients whose weight updates are most distant from the median.
@@ -166,7 +169,7 @@ FLTRUST_SERVER_LR      = 1e-3
 # Trust score at or below this value causes the client to be flagged as Byzantine
 # in the detection log (fed into Upgrade 3).  ReLU already zeroes negatives;
 # this threshold lets you also zero out near-zero trust scores from noisy clients.
-FLTRUST_MIN_TRUST_SCORE = 0.0   # 0.0 = ReLU only (strict); raise to e.g. 0.05 to be stricter
+FLTRUST_MIN_TRUST_SCORE = 0.5   # Flags clients below 50% directional alignment
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RESPONSE ENGINE — Critical Infrastructure Allowlist
@@ -405,6 +408,13 @@ def load_ae_thresholds() -> tuple[float, float, bool]:
         high   = float(data["recommended_MSE_THRESHOLD_HIGH"])
         medium = float(data["recommended_MSE_THRESHOLD_MEDIUM"])
 
+        # Sanity-check the P90/P99 collapse issue documented in the paper (Hypotheses H1, H3).
+        # If the gap is < 0.002 the three-tier severity system collapses because the
+        # reconstruction error distributions for normal traffic are too homogeneous.
+        # As explicitly acknowledged in the ablation study, without per-attack-category
+        # threshold recalibration or normalized anomaly scoring, real-world deployment
+        # requires diverse traffic validation. See scripts/test_severity_collapse_fix.py
+        # for the synthetic diverse-traffic demonstration.
         p90 = data.get("p90", medium)
         p99 = data.get("p99", high)
         if abs(p99 - p90) < 0.002:

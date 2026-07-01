@@ -178,17 +178,17 @@ def _verify_global_weights(
     computed_hash = hash_model_weights(arrays_to_hash)
 
     # ── High-visibility audit output ─────────────────────────────────────
-    print(f"\n{'═'*60}")
-    print(f"  [SECURITY AUDIT] Client: {client_id}  |  Phase: {context.upper()}")
-    print(f"  [SECURITY AUDIT] Received Global Model.")
-    print(f"  [SECURITY AUDIT] Computed SHA-256: {computed_hash}")
-    print(f"{'═'*60}")
+    logger.debug(f"\n{'═'*60}")
+    logger.debug(f"  [SECURITY AUDIT] Client: {client_id}  |  Phase: {context.upper()}")
+    logger.debug(f"  [SECURITY AUDIT] Received Global Model.")
+    logger.debug(f"  [SECURITY AUDIT] Computed SHA-256: {computed_hash}")
+    logger.debug(f"{'═'*60}")
 
     # ── Verification against Ganache smart contract ledger ───────────────
     # In production, this would call:
     #   blockchain.verify_model(version, computed_hash)
     # For the demo, we read the server's trusted hash registry and compare.
-    print(f"  [SECURITY AUDIT] Verifying hash against Ganache smart contract ledger …")
+    logger.debug(f"  [SECURITY AUDIT] Verifying hash against Ganache smart contract ledger …")
 
     registry_path = Path(cfg.LOGS_DIR) / "hash_registry.json"
     ledger_hash = None
@@ -204,34 +204,34 @@ def _verify_global_weights(
 
     if mitm_active:
         # In a MITM simulation, the tampered hash will NOT match
-        print(f"  [SECURITY AUDIT] ❌ HASH MISMATCH DETECTED!")
-        print(f"  [SECURITY AUDIT]   Computed:  {computed_hash[:24]}…")
+        logger.debug(f"  [SECURITY AUDIT] ❌ HASH MISMATCH DETECTED!")
+        logger.debug(f"  [SECURITY AUDIT]   Computed:  {computed_hash[:24]}…")
         if ledger_hash:
-            print(f"  [SECURITY AUDIT]   On-chain:  {ledger_hash[:24]}…")
+            logger.debug(f"  [SECURITY AUDIT]   On-chain:  {ledger_hash[:24]}…")
         else:
             # Even without a ledger entry, the tampered hash differs from
             # the hash of the original (un-tampered) weights.
             original_hash = hash_model_weights(global_arrays)
-            print(f"  [SECURITY AUDIT]   Expected:  {original_hash[:24]}…")
-        print(f"  [SECURITY AUDIT] ⛔ WEIGHTS TAMPERED IN TRANSIT — REJECTING MODEL UPDATE!")
-        print(f"{'═'*60}\n")
+            logger.debug(f"  [SECURITY AUDIT]   Expected:  {original_hash[:24]}…")
+        logger.debug(f"  [SECURITY AUDIT] ⛔ WEIGHTS TAMPERED IN TRANSIT — REJECTING MODEL UPDATE!")
+        logger.debug(f"{'═'*60}\n")
         return arrays_to_hash, False
 
     # ── Normal path: hash matches ────────────────────────────────────────
     if ledger_hash:
         if computed_hash == ledger_hash:
-            print(f"  [SECURITY AUDIT] ✅ Hash matches Ganache ledger entry ({ledger_hash[:16]}…)")
+            logger.debug(f"  [SECURITY AUDIT] ✅ Hash matches Ganache ledger entry ({ledger_hash[:16]}…)")
         else:
             # Hash doesn't match ledger but this isn't MITM — could be
             # intermediate round (ledger only has final round hash).
-            print(f"  [SECURITY AUDIT] ℹ️  Intermediate round — ledger hash is for final model.")
-            print(f"  [SECURITY AUDIT] ✅ Hash recorded locally for audit trail.")
+            logger.debug(f"  [SECURITY AUDIT] ℹ️  Intermediate round — ledger hash is for final model.")
+            logger.debug(f"  [SECURITY AUDIT] ✅ Hash recorded locally for audit trail.")
     else:
-        print(f"  [SECURITY AUDIT] ℹ️  No ledger entry yet (pre-final round).")
-        print(f"  [SECURITY AUDIT] ✅ Hash recorded locally. Will verify at final round.")
+        logger.debug(f"  [SECURITY AUDIT] ℹ️  No ledger entry yet (pre-final round).")
+        logger.debug(f"  [SECURITY AUDIT] ✅ Hash recorded locally. Will verify at final round.")
 
-    print(f"  [SECURITY AUDIT] ✅ Integrity verified. Loading weights into local model.")
-    print(f"{'═'*60}\n")
+    logger.debug(f"  [SECURITY AUDIT] ✅ Integrity verified. Loading weights into local model.")
+    logger.debug(f"{'═'*60}\n")
 
     return global_arrays, True
 
@@ -281,11 +281,32 @@ class AURAFlowerClient(fl.client.Client):
             self.model.autoencoder.parameters(),
             lr=cfg.AE_LEARNING_RATE,
         )
+        # ADD: healthy flow buffer
+        self._healthy_buffer: List[torch.Tensor] = []
+        
         logger.info(
             f"[{client_id}] Flower client initialised  |  "
             f"train={len(train_data)}  val={len(val_data)}  "
             f"epochs={local_epochs}  device={self.device}"
         )
+
+    # ADD: new RT inference method — called continuously outside FL rounds
+    def process_incoming_batch(self, batch: torch.Tensor) -> bool:
+        """
+        RT inference loop — runs continuously on live NetFlow.
+        NOT called during FL rounds.
+        Returns True if batch was benign (stored), False if anomalous (alerted).
+        """
+        self.model.autoencoder.eval()
+        with torch.no_grad():
+            x_hat, z = self.model.autoencoder(batch)
+            error = nn.functional.mse_loss(x_hat, batch).item()
+
+        if error < cfg.MSE_THRESHOLD_HIGH:
+            self._healthy_buffer.append(batch.cpu())  # store benign
+            return True
+        else:
+            return False  # anomalous — caller handles alert pipeline
 
     # ------------------------------------------------------------------
     # Flower Protocol Methods
@@ -325,7 +346,7 @@ class AURAFlowerClient(fl.client.Client):
         # Step 3: Load weights ONLY after verification
         if not is_verified:
             # MITM detected — reject the update, keep current local weights
-            print(f"  [{self.client_id}] ⛔ FIT ABORTED — using previous local weights.")
+            logger.debug(f"  [{self.client_id}] ⛔ FIT ABORTED — using previous local weights.")
             logger.warning(f"[{self.client_id}] MITM detected in fit(). "
                            f"Rejecting global weights. Training on stale local model.")
             # Still train on the existing (safe) local model so the client
@@ -375,7 +396,7 @@ class AURAFlowerClient(fl.client.Client):
         # Step 3: Load weights ONLY after verification
         if not is_verified:
             # MITM detected — evaluate on current (safe) local model
-            print(f"  [{self.client_id}] ⛔ EVALUATE using local weights (global rejected).")
+            logger.debug(f"  [{self.client_id}] ⛔ EVALUATE using local weights (global rejected).")
             logger.warning(f"[{self.client_id}] MITM detected in evaluate(). "
                            f"Evaluating on local model instead of tampered global model.")
         else:
@@ -400,42 +421,43 @@ class AURAFlowerClient(fl.client.Client):
 
     def _local_train(self) -> Tuple[int, float]:
         """
-        Run unsupervised autoencoder training on local data.
-
-        We train in batch mode — the autoencoder learns to reconstruct
-        the local network's 'normal' flow distribution.  If this client's
-        network gets attacked, the reconstruction error will spike, and
-        the updated weights (incorporating the new attack-learned boundary)
-        will be shared with the federation.
-
-        Returns:  (num_training_examples, final_batch_loss)
+        FL round training — called only when server selects this client.
+        Trains on accumulated healthy_buffer, one pass, then clears buffer.
         """
+        if not self._healthy_buffer:
+            # Buffer empty — client was fully under attack, no healthy flows
+            # Return zero update — server's magnitude normalisation handles this
+            logger.warning(f"[{self.client_id}] Healthy buffer empty — "
+                          f"no benign flows available. Sending zero update.")
+            return 0, 0.0
+
+        # Concatenate buffer into one dataset
+        buffer_data = torch.cat(self._healthy_buffer, dim=0).to(self.device)
+
         ae = self.model.autoencoder
         ae.train()
-
-        dataset = torch.utils.data.TensorDataset(self.train_data)
+        dataset = torch.utils.data.TensorDataset(buffer_data)
         loader  = torch.utils.data.DataLoader(
             dataset, batch_size=cfg.AE_BATCH_SIZE, shuffle=True
         )
 
-        last_loss = 0.0
-        for epoch in range(self.local_epochs):
-            epoch_loss = 0.0
-            for (batch,) in loader:
-                self.optimizer.zero_grad()
-                x_hat, z = ae(batch)
-                loss      = ae.reconstruction_loss(batch, x_hat, z)
-                loss.backward()
-                # Gradient clipping: prevents exploding gradients with
-                # adversarially crafted data (a known FL poisoning vector)
-                torch.nn.utils.clip_grad_norm_(ae.parameters(), max_norm=1.0)
-                self.optimizer.step()
-                epoch_loss += loss.item()
+        # ONE pass only — buffer represents one time window
+        last_loss    = 0.0
+        trained_count = 0
+        for (batch,) in loader:
+            self.optimizer.zero_grad()
+            x_hat, z = ae(batch)
+            loss = ae.reconstruction_loss(batch, x_hat, z)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(ae.parameters(), max_norm=1.0)
+            self.optimizer.step()
+            last_loss     = loss.item()
+            trained_count += len(batch)
 
-            last_loss = epoch_loss / max(len(loader), 1)
-            logger.debug(f"  [{self.client_id}] epoch={epoch+1}  loss={last_loss:.4f}")
+        # Clear buffer after FL round — next window starts fresh
+        self._healthy_buffer.clear()
 
-        return len(self.train_data), last_loss
+        return trained_count, last_loss
 
 
 # ─────────────────────────────────────────────────────────────────────────────
