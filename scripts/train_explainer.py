@@ -203,7 +203,7 @@ def main():
         try:
             bundle = AURAModelBundle()
             bundle.load_state_dict(
-                torch.load(str(bundle_path), map_location=device)
+                torch.load(str(bundle_path), map_location=device, weights_only=False)
             )
             ae = bundle.autoencoder
             print(f"  ✓ Loaded AE from {bundle_path}")

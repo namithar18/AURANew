@@ -155,7 +155,7 @@ def run_experiment(
         _pretrained = Path(cfg.MODELS_DIR) / "global_model.pth"
         if _pretrained.exists():
             try:
-                state = torch.load(_pretrained, map_location="cpu")
+                state = torch.load(_pretrained, map_location="cpu", weights_only=False)
                 client.model.load_state_dict(state)
                 client.model.eval()
             except Exception as e:

@@ -114,7 +114,7 @@ class DashboardService:
         bundle_path = cfg.MODELS_DIR / "aura_bundle.pth"
         bundle = AURAModelBundle()
         if bundle_path.exists():
-            bundle.load_state_dict(torch.load(bundle_path, map_location="cpu"))
+            bundle.load_state_dict(torch.load(bundle_path, map_location="cpu", weights_only=False))
             self.model_status = "PRE-TRAINED"
         else:
             self.model_status = "UNTRAINED (DEMO MODE)"
