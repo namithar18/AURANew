@@ -471,6 +471,27 @@ class KrumFedAURA(FedAvg):
         # Global model reference — updated after each successful aggregation.
         # FLTrust needs the current global state to compute per-client deltas.
         self._global_model: AURAModelBundle = AURAModelBundle()
+        
+        # Load pre-trained weights so server reference gradient is meaningful
+        # from round 1. Without this, round 1 trust scores are ~0.01 (random
+        # vectors are nearly orthogonal in high dimensions).
+        _pretrained = Path(cfg.MODELS_DIR) / "global_model.pth"
+        if _pretrained.exists():
+            try:
+                state = torch.load(_pretrained, map_location="cpu")
+                self._global_model.load_state_dict(state)
+                self._global_model.eval()
+                logger.info(f"[FLTrust] Pre-trained global model loaded from {_pretrained}")
+            except Exception as e:
+                logger.warning(
+                    f"[FLTrust] Could not load pre-trained model ({e}). "
+                    f"Starting from random init — round 1 trust scores will be near zero."
+                )
+        else:
+            logger.warning(
+                f"[FLTrust] No pre-trained model at {_pretrained}. "
+                f"Run offline AE training first for meaningful trust scores."
+            )
 
         # Per-round trust score history (for dashboard + Upgrade 3 detection log)
         self._trust_history: List[dict] = []
@@ -542,7 +563,7 @@ class KrumFedAURA(FedAvg):
                         f"num_examples={fit_res.num_examples}  loss={client_loss}")
 
         # ── FLTrust Aggregation ──────────────────────────────────────────────────────────────
-        print(f"\n{round_tag} Running FLTrust aggregation on {n_received} updates …")
+        logger.debug(f"\n{round_tag} Running FLTrust aggregation on {n_received} updates …")
         aggregated, trust_scores, flagged_indices = fltrust_aggregate(
             global_model   = self._global_model,
             client_updates = client_updates,
@@ -556,7 +577,7 @@ class KrumFedAURA(FedAvg):
         # ── Log per-client trust scores ──────────────────────────────────────────
         for idx, (trust, (cp, fr)) in enumerate(zip(trust_scores, results)):
             status = "BYZANTINE SUSPECT" if idx in flagged_indices else "trusted"
-            print(
+            logger.debug(
                 f"{round_tag} [FLTrust] Client {idx} — "
                 f"trust={trust:.4f}  [{status}]  "
                 f"loss={fr.metrics.get('train_loss', 'N/A')}"
@@ -585,8 +606,8 @@ class KrumFedAURA(FedAvg):
 
         # ── SHA-256 Hash (computed every round — clients verify weights) ──────
         model_hash = hash_model_weights(aggregated)
-        print(f"{round_tag} Global Model {model_version_tag} aggregated.")
-        print(f"{round_tag} SHA-256 hash: {model_hash}")
+        logger.debug(f"{round_tag} Global Model {model_version_tag} aggregated.")
+        logger.debug(f"{round_tag} SHA-256 hash: {model_hash}")
 
         # ── Blockchain Audit Log (FINAL ROUND ONLY) ──────────────────────────
         # Intermediate rounds converge the model; only the final aggregated
@@ -611,7 +632,7 @@ class KrumFedAURA(FedAvg):
             self._write_trusted_registry(final_version, model_hash)
             model_version_tag = final_version
         else:
-            print(f"{round_tag} Intermediate round — hash not minted yet "
+            logger.debug(f"{round_tag} Intermediate round — hash not minted yet "
                   f"(blockchain mint on round {self.num_rounds} only).")
 
         # Expose which indices were selected so client_statuses can use it

@@ -53,7 +53,7 @@ for noisy in ["flwr", "flwr.server", "flwr.simulation", "ray", "urllib3",
 
 from aura.fl_server import KrumFedAURA, KrumOnlyStrategy
 from aura.fl_client import AURAFlowerClient
-from aura.data_loader import CICIDSDataLoader, load_client_partition
+from aura.data_loader import CICIDSDataLoader, load_client_subpartition
 from aura.attack_injector import _benign_profile
 
 # ── Global scaler — fitted once, shared across all experiments ───────────────
@@ -75,33 +75,28 @@ def generate_client_data(
     is_byzantine: bool,
     is_rare: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    n_samples   = 200
-    feature_dim = cfg.FEATURE_DIM
-    # FIX: use a valid org key so load_client_partition doesn't fail silently.
-    # Cycle through the 5 known org names for the 10 simulated clients.
-    _org_names  = ["hospital", "bank", "university", "isp", "retail"]
-    org_key     = _org_names[client_idx % len(_org_names)]
-    # Use the same numbering convention as create_mock_clients
-    _org_nums   = {"hospital": 1, "bank": 2, "university": 3, "isp": 4, "retail": 5}
-    client_num  = _org_nums[org_key]
-    client_id_str = f"org_{org_key}_{client_num}"
+    n_samples = 200
 
     train_data, val_data = None, None
     if _shared_scaler is not None:
         try:
-            train_data, val_data = load_client_partition(
-                client_id=client_id_str, scaler=_shared_scaler
+            # Use sub-partition: clients 0-4 get first half,
+            # clients 5-9 get second half of same org partition
+            # → 10 genuinely non-overlapping datasets
+            train_data, val_data = load_client_subpartition(
+                client_idx=client_idx,
+                scaler=_shared_scaler,
             )
             if len(train_data) > n_samples:
                 train_data = train_data[:n_samples]
             if len(val_data) > max(1, n_samples // 5):
                 val_data = val_data[:n_samples // 5]
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Sub-partition failed for client {client_idx}: {e}")
 
     if train_data is None:
-        _train_np  = _benign_profile(n_samples, feature_dim)
-        _val_np    = _benign_profile(max(1, n_samples // 5), feature_dim)
+        _train_np  = _benign_profile(n_samples, cfg.FEATURE_DIM)
+        _val_np    = _benign_profile(max(1, n_samples // 5), cfg.FEATURE_DIM)
         train_data = torch.tensor(_train_np, dtype=torch.float32)
         val_data   = torch.tensor(_val_np,   dtype=torch.float32)
 
@@ -154,18 +149,28 @@ def run_experiment(
             is_rare=(role == "rare"),
         )
         client = AURAFlowerClient(f"client_{cid}", train_data, val_data)
-        
-        # Simulating time window before FL round:
+    
+        # Load pre-trained weights so process_incoming_batch uses a
+        # calibrated AE, not random weights — filtering is meaningless otherwise
+        _pretrained = Path(cfg.MODELS_DIR) / "global_model.pth"
+        if _pretrained.exists():
+            try:
+                state = torch.load(_pretrained, map_location="cpu")
+                client.model.load_state_dict(state)
+                client.model.eval()
+            except Exception as e:
+                logger.warning(f"Could not load pre-trained weights: {e}")
+    
+        # Simulate time window before FL round
         if role == "byzantine":
-            # Adversary controls the node and bypasses RT checks to directly poison the buffer
+            # Adversary bypasses RT checks — poisons buffer directly
             client._healthy_buffer.append(train_data.cpu())
         else:
-            # Honest node processes traffic through RT inference pipeline
-            batch_size = cfg.AE_BATCH_SIZE
-            for i in range(0, len(train_data), batch_size):
-                batch = train_data[i:i+batch_size]
+            # Honest node: RT inference filters healthy flows into buffer
+            for start in range(0, len(train_data), cfg.AE_BATCH_SIZE):
+                batch = train_data[start:start + cfg.AE_BATCH_SIZE]
                 client.process_incoming_batch(batch)
-                
+    
         return client.to_client()
 
     if strategy_name == "FedAvg":
