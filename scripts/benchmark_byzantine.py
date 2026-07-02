@@ -37,6 +37,7 @@ import torch
 import flwr as fl
 from typing import Dict, List, Tuple
 from flwr.server.strategy import FedAvg
+from flwr.common import Context
 
 # ── Configure logging: only show our benchmark messages ──────────────────────
 logging.basicConfig(
@@ -134,21 +135,27 @@ def run_experiment(
     roles = ["benign"] * num_clients
     for i in range(num_byzantine):
         roles[i] = "byzantine"
-    if rare_client and "benign" in roles:
-        roles[-1] = "rare"
+    if rare_client:
+        # Find last benign slot explicitly
+        for i in range(len(roles) - 1, -1, -1):
+            if roles[i] == "benign":
+                roles[i] = "rare"
+                break
+        else:
+            logger.warning("No benign slot available for rare client — skipping.")
 
     rare_idx      = roles.index("rare") if "rare" in roles else None
     byzantine_idx = [i for i, r in enumerate(roles) if r == "byzantine"]
 
-    def client_fn(cid: str) -> fl.client.Client:
-        idx  = int(cid)
+    def client_fn(context: Context) -> fl.client.Client:
+        idx  = int(context.node_id) % num_clients
         role = roles[idx]
         train_data, val_data = generate_client_data(
             idx,
             is_byzantine=(role == "byzantine"),
             is_rare=(role == "rare"),
         )
-        client = AURAFlowerClient(f"client_{cid}", train_data, val_data)
+        client = AURAFlowerClient(f"client_{idx}", train_data, val_data)
     
         # Load pre-trained weights so process_incoming_batch uses a
         # calibrated AE, not random weights — filtering is meaningless otherwise
@@ -156,6 +163,10 @@ def run_experiment(
         if _pretrained.exists():
             try:
                 state = torch.load(_pretrained, map_location="cpu", weights_only=False)
+                if "model_state_dict" in state:
+                    state = state["model_state_dict"]
+                elif "state_dict" in state:
+                    state = state["state_dict"]
                 client.model.load_state_dict(state)
                 client.model.eval()
             except Exception as e:
@@ -202,7 +213,7 @@ def run_experiment(
         num_clients=num_clients,
         config=fl.server.ServerConfig(num_rounds=cfg.FL_NUM_ROUNDS),
         strategy=strategy,
-        client_resources={"num_cpus": 4, "num_gpus": 0.0},
+        client_resources={"num_cpus": 2, "num_gpus": 1.0 / num_clients},
     )
 
     # ── Extract the metrics we actually care about ────────────────────────

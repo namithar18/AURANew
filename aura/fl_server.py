@@ -479,6 +479,10 @@ class KrumFedAURA(FedAvg):
         if _pretrained.exists():
             try:
                 state = torch.load(_pretrained, map_location="cpu", weights_only=False)
+                if "model_state_dict" in state:
+                    state = state["model_state_dict"]
+                elif "state_dict" in state:
+                    state = state["state_dict"]
                 self._global_model.load_state_dict(state)
                 self._global_model.eval()
                 logger.info(f"[FLTrust] Pre-trained global model loaded from {_pretrained}")

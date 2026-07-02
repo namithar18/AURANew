@@ -88,8 +88,14 @@ def model_to_ndarrays(model: nn.Module) -> List[np.ndarray]:
 
 def ndarrays_to_model(model: nn.Module, arrays: List[np.ndarray]) -> None:
     """Load a list of NumPy arrays into model parameters (in-place)."""
+    params = list(model.parameters())
+    if len(params) != len(arrays):
+        raise ValueError(
+            f"Parameter count mismatch: model has {len(params)}, "
+            f"received {len(arrays)} arrays from server."
+        )
     with torch.no_grad():
-        for p, arr in zip(model.parameters(), arrays):
+        for p, arr in zip(params, arrays):
             p.copy_(torch.tensor(arr))
 
 
@@ -297,6 +303,7 @@ class AURAFlowerClient(fl.client.Client):
         NOT called during FL rounds.
         Returns True if batch was benign (stored), False if anomalous (alerted).
         """
+        batch = batch.to(self.device)
         self.model.autoencoder.eval()
         with torch.no_grad():
             x_hat, z = self.model.autoencoder(batch)
