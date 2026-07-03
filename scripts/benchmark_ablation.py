@@ -382,9 +382,28 @@ def collect_test_windows(
             f"{cfg.CSV_DIR} and DATA_LOAD_FRACTION ({cfg.DATA_LOAD_FRACTION}) is sufficient."
         )
 
-    test_start = int(total * (1.0 - test_fraction))
-    train_windows = all_windows[:test_start]
-    test_windows = all_windows[test_start:]
+    # ── Stratified split: ensure attacks appear in BOTH train and test ──────
+    # NF-UNSW-NB15-v3 has attacks concentrated at the start of the file,
+    # so a naive tail-slice produces a test set with 0 attacks.
+    # We separate windows by whether they contain ANY attack edge, split each
+    # bucket 80/20, then re-sort by original index to preserve temporal order
+    # within each partition (required by Mode D's EMA tracker).
+    attack_idx   = [i for i, (_, lbl) in enumerate(all_windows) if lbl.sum() > 0]
+    benign_idx   = [i for i, (_, lbl) in enumerate(all_windows) if lbl.sum() == 0]
+
+    def _split(indices):
+        cut = int(len(indices) * (1.0 - test_fraction))
+        return indices[:cut], indices[cut:]
+
+    atk_train, atk_test   = _split(attack_idx)
+    ben_train, ben_test   = _split(benign_idx)
+
+    train_idx = sorted(atk_train + ben_train)
+    test_idx  = sorted(atk_test  + ben_test)
+
+    train_windows = [all_windows[i] for i in train_idx]
+    test_windows  = [all_windows[i] for i in test_idx]
+
 
     n_calib = max(5, int(len(train_windows) * 0.10))
     calibration_windows = train_windows[:n_calib]
@@ -531,7 +550,7 @@ def run_mode_d(ae: FlowAutoencoder, stgnn: AuraSTGNN, platt_scaler, test_windows
 
     for graph, edge_labels in test_windows:
         x = graph["x"].to(device)
-        edge_index = graph["edge_index"].to(dvice)
+        edge_index = graph["edge_index"].to(device)
         edge_attr = graph["edge_attr"].to(device)
         num_nodes = x.shape[0]
 
