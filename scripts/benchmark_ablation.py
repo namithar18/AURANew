@@ -272,9 +272,15 @@ class NodeEMATracker:
 
     def update_and_check(self, node_id: int, residual: float) -> bool:
         """
-        Update this node's EMA state with a new residual reading and return
-        True if the node should be predicted POSITIVE this window (i.e. it
-        has met the K-consecutive-fire persistence requirement).
+        Update this node's EMA baseline and return True if the node should
+        be predicted POSITIVE this window.
+
+        **Robust EMA**: the baseline (mean, var) only updates when the
+        current reading does NOT trigger an anomaly alert. If it does fire,
+        the baseline is frozen for this window so that a sustained attack
+        cannot contaminate the reference distribution and erase itself from
+        detection (the "EMA chasing the attack" failure mode seen when the
+        update is unconditional).
         """
         seen = self._seen.get(node_id, 0)
         mean = self._mean.get(node_id, self._init_mean)
@@ -285,12 +291,18 @@ class NodeEMATracker:
             std = max(var ** 0.5, 1e-8)
             fired = residual > (mean + self.sigma_mult * std)
 
-        # Update EMA mean/variance (always — even during warm-up)
-        delta = residual - mean
-        new_mean = mean + self.alpha * delta
-        new_var = (1 - self.alpha) * (var + self.alpha * delta * delta)
-        self._mean[node_id] = new_mean
-        self._var[node_id] = new_var
+        # Robust EMA: only update the baseline when the reading is NOT an
+        # anomaly. Updating on anomalous readings causes the EMA mean to
+        # climb toward the attack level, raising the threshold and hiding
+        # subsequent attack windows from detection.
+        if not fired:
+            delta = residual - mean
+            new_mean = mean + self.alpha * delta
+            new_var = (1 - self.alpha) * (var + self.alpha * delta * delta)
+            self._mean[node_id] = new_mean
+            self._var[node_id] = new_var
+        # else: baseline frozen — attack cannot "teach" the EMA its own level
+
         self._seen[node_id] = seen + 1
 
         streak = self._streak.get(node_id, 0)
@@ -529,7 +541,9 @@ def run_mode_c(ae: FlowAutoencoder, stgnn: AuraSTGNN, platt_scaler, test_windows
 
 def run_mode_d(ae: FlowAutoencoder, stgnn: AuraSTGNN, platt_scaler, test_windows: list,
                ema_mean: float, ema_std: float, device: torch.device,
-               gnn_threshold: float = 0.5) -> tuple:
+               gnn_threshold: float = 0.5,
+               ema_sigma_mult: float = cfg.EMA_SIGMA_MULTIPLIER,
+               k_consecutive: int = cfg.K_CONSECUTIVE_READINGS) -> tuple:
     """
     Mode D — Sequential Cascade + EMA Temporal Persistence (Doc Config D).
 
@@ -545,7 +559,11 @@ def run_mode_d(ae: FlowAutoencoder, stgnn: AuraSTGNN, platt_scaler, test_windows
     collect_test_windows() preserves stream order, so this holds as long as
     test_windows is passed through unmodified.
     """
-    tracker = NodeEMATracker(init_mean=ema_mean, init_std=ema_std)
+    tracker = NodeEMATracker(
+        init_mean=ema_mean, init_std=ema_std,
+        sigma_mult=ema_sigma_mult,
+        k_consecutive=k_consecutive,
+    )
     all_y_true, all_y_pred, all_y_score = [], [], []
 
     for graph, edge_labels in test_windows:
@@ -639,6 +657,24 @@ def main():
     parser.add_argument("--test-fraction", type=float, default=0.20)
     parser.add_argument("--ae-percentile", type=float, default=95.0)
     parser.add_argument("--gnn-threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--ema-sigma", type=float, default=cfg.EMA_SIGMA_MULTIPLIER,
+        help=(
+            "Sigma multiplier for Mode D EMA gate (default: cfg.EMA_SIGMA_MULTIPLIER="
+            f"{cfg.EMA_SIGMA_MULTIPLIER}). Lower values (e.g. 1.0) are more sensitive; "
+            "higher values (e.g. 3.0) are stricter. Robust EMA now freezes the baseline "
+            "on anomalous readings so sigma mainly controls FPR, not Recall."
+        ),
+    )
+    parser.add_argument(
+        "--k-consecutive", type=int, default=cfg.K_CONSECUTIVE_READINGS,
+        help=(
+            f"Number of consecutive windows a node must fire before being flagged as positive "
+            f"(default: cfg.K_CONSECUTIVE_READINGS={cfg.K_CONSECUTIVE_READINGS}). "
+            "Set to 1 to flag on the first anomalous window (maximum Recall, "
+            "slightly higher FPR). Increase for stricter low-and-slow detection."
+        ),
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -701,7 +737,7 @@ def main():
     print(f"  GNN threshold: {args.gnn_threshold}")
     print(f"{'=' * 72}\n")
 
-    def run_and_record(name, fn, auc_approx):
+    def run_and_record(name, fn, auc_approx, note=None):
         t0 = time.time()
         logger.info(f"▶ Running {name} …")
         y_true, y_pred, y_score = fn()
@@ -710,11 +746,19 @@ def main():
         metrics["Time_s"] = round(time.time() - t0, 2)
         results[name] = metrics
         logger.info(f"  {name} done in {metrics['Time_s']}s — {metrics}")
+        if note:
+            logger.info(f"    ↳ {note}")
 
     run_and_record(
         "A: Autoencoder Only",
         lambda: run_mode_a(ae, test_windows, ae_threshold, device),
         auc_approx=False,
+        note=(
+            f"AE uses p{args.ae_percentile:.0f} benign threshold ({ae_threshold:.6f}). "
+            "High Recall is expected — the AE is a broad statistical tripwire. "
+            "Low Precision is expected — ~5% of benign nodes exceed the p95 cut, "
+            "generating FPs. Cascade (Mode C) uses GNN to eliminate these."
+        ),
     )
     run_and_record(
         "B: GraphSAGE Only",
@@ -728,32 +772,65 @@ def main():
     )
     run_and_record(
         "D: Cascade + EMA Persistence",
-        lambda: run_mode_d(ae, stgnn, platt_scaler, test_windows, ema_mean, ema_std, device, args.gnn_threshold),
+        lambda: run_mode_d(
+            ae, stgnn, platt_scaler, test_windows, ema_mean, ema_std, device,
+            args.gnn_threshold,
+            ema_sigma_mult=args.ema_sigma,
+            k_consecutive=args.k_consecutive,
+        ),
         auc_approx=True,
+        note=(
+            f"Robust EMA (baseline frozen on anomalous readings). "
+            f"sigma_mult={args.ema_sigma}, K_consecutive={args.k_consecutive}, "
+            f"warmup={cfg.EMA_WARMUP_BATCHES}, alpha={cfg.EMA_ALPHA}."
+        ),
     )
 
     # ── 5. Export + print ────────────────────────────────────────────────────
     reports_dir = PROJECT_ROOT / "reports"
     df = export_results(results, reports_dir)
 
-    print(f"\n{'=' * 72}")
-    print("  ABLATION STUDY RESULTS")
-    print(f"{'=' * 72}")
-    print(df.to_string())
-    print(f"{'=' * 72}")
-    print(
-        "\n  NOTE: Config E ('Full AURA pipeline') is not reported. It additionally\n"
-        "  requires FLTrust federated aggregation and the HITL response engine,\n"
-        "  neither of which alters per-node detection scores measured here — see\n"
-        "  module docstring for details.\n"
-        "  NOTE: ROC-AUC/PR-AUC for Modes C and D are approximate (flagged\n"
-        "  AUC_Approximate=True): gated-out nodes never receive a GraphSAGE score,\n"
-        "  so no single continuous decision function exists across all nodes.\n"
-    )
-    print(f"  ✓ Exported to:")
-    print(f"    • {reports_dir / 'ablation_results.csv'}")
-    print(f"    • {reports_dir / 'ablation_results.json'}")
-    print(f"{'=' * 72}\n")
+    # Flush all logging handlers so their stderr output does not interleave
+    # with the table printed below (a common issue when both go to the same
+    # terminal and the logger is line-buffered while stdout is block-buffered).
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    import sys as _sys
+    _sys.stderr.flush()
+
+    table_lines = [
+        f"",
+        f"{'=' * 72}",
+        f"  ABLATION STUDY RESULTS",
+        f"{'=' * 72}",
+        df.to_string(),
+        f"{'=' * 72}",
+        f"",
+        f"  NOTE: Config E ('Full AURA pipeline') is not reported. It additionally",
+        f"  requires FLTrust federated aggregation and the HITL response engine,",
+        f"  neither of which alters per-node detection scores measured here — see",
+        f"  module docstring for details.",
+        f"  NOTE: ROC-AUC/PR-AUC for Modes C and D are approximate (flagged",
+        f"  AUC_Approximate=True): gated-out nodes never receive a GraphSAGE score,",
+        f"  so no single continuous decision function exists across all nodes.",
+        f"",
+        f"  NOTE: Mode A (AE Only) low Precision is by design — the p{args.ae_percentile:.0f} threshold",
+        f"  intentionally passes ~{100 - args.ae_percentile:.0f}% of benign nodes as FPs so that the",
+        f"  downstream GNN (Mode C/D) has full coverage. High Recall is the goal.",
+        f"  NOTE: Mode D Recall will be lower than Mode C because the EMA gate",
+        f"  (K={args.k_consecutive} consecutive windows) is stricter than the flat AE threshold.",
+        f"  Use --k-consecutive 1 to maximise Recall, or tune --ema-sigma for FPR.",
+        f"",
+        f"  Exported to:",
+        f"    {reports_dir / 'ablation_results.csv'}",
+        f"    {reports_dir / 'ablation_results.json'}",
+        f"{'=' * 72}",
+        f"",
+    ]
+    # Write atomically to stdout with utf-8 to avoid Windows cp1252 errors
+    # on unicode chars (arrows, bullets, etc.) that appear in df.to_string().
+    _sys.stdout.buffer.write(("\n".join(table_lines) + "\n").encode("utf-8", errors="replace"))
+    _sys.stdout.flush()
 
 
 if __name__ == "__main__":
