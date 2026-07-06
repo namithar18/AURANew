@@ -282,6 +282,19 @@ def main():
     print("\n" + "=" * 70)
     print("  AURA Byzantine Benchmark  --  Section 5.1.5  (Hypothesis H2)")
     print("=" * 70)
+
+    # ── Pre-flight data provenance check ─────────────────────────────────────
+    import os
+    from datetime import datetime
+    stats_path = cfg.MODELS_DIR / "attack_class_stats.json"
+    if not stats_path.exists():
+        raise FileNotFoundError(
+            "Channel 2 federation requires real data-derived profiles. "
+            "Run: python scripts/train_explainer.py before benchmarking."
+        )
+    mtime = datetime.fromtimestamp(stats_path.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+    print(f"  [PRE-FLIGHT] Verified attack_class_stats.json exists (modified: {mtime})")
+    print("=" * 70)
     num_clients = 10
 
     # Experiment 1: Byzantine Ratio Sweep

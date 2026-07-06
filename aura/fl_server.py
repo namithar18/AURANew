@@ -848,7 +848,20 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="AURA FL Aggregation Server")
+    import os
+    from datetime import datetime
+
+    # ── Pre-flight data provenance check ─────────────────────────────────────
+    stats_path = Path(cfg.MODELS_DIR) / "attack_class_stats.json"
+    if not stats_path.exists():
+        raise FileNotFoundError(
+            "Channel 2 federation requires real data-derived profiles. "
+            "Run: python scripts/train_explainer.py before starting the server."
+        )
+    mtime = datetime.fromtimestamp(stats_path.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+    print(f"  [PRE-FLIGHT] Verified attack_class_stats.json exists (modified: {mtime})")
+
+    parser = argparse.ArgumentParser(description="AURA FL Server (FLTrust)")
     parser.add_argument(
         "--address", default=cfg.FL_SERVER_ADDRESS,
         help="gRPC bind address (default: %(default)s). "

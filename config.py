@@ -583,21 +583,25 @@ def load_attack_corruption_profiles() -> dict:
     """
     stats_path = MODELS_DIR / "attack_class_stats.json"
     if not stats_path.exists():
-        _cfg_log.warning(
-            "[CONFIG] ⚠️  saved_models/attack_class_stats.json NOT FOUND. "
-            "Using sentinel ATTACK_CORRUPTION_PROFILES — these are NOT data-derived. "
-            "Run: python scripts/train_explainer.py"
+        import sys
+        main_script = sys.argv[0] if sys.argv else ""
+        if "train_explainer.py" in main_script or "train.py" in main_script:
+            _cfg_log.warning("[CONFIG] attack_class_stats.json not found, but allowing build script to proceed.")
+            return _SENTINEL_ATTACK_PROFILES
+
+        raise FileNotFoundError(
+            "[CONFIG] attack_class_stats.json NOT FOUND. "
+            "Channel 2 federation requires real data-derived profiles. "
+            "Run: python scripts/train_explainer.py before benchmarking."
         )
-        return _SENTINEL_ATTACK_PROFILES
 
     try:
         stats_data = json.loads(stats_path.read_text())
     except Exception as exc:
-        _cfg_log.error(
+        raise ValueError(
             f"[CONFIG] Failed to parse attack_class_stats.json: {exc}. "
-            "Falling back to sentinel profiles."
+            "Channel 2 federation requires a valid data-derived profile JSON."
         )
-        return _SENTINEL_ATTACK_PROFILES
 
     # Build index → feature-key reverse map from FEATURE_INDEX_MAP
     idx_to_key: dict[int, str] = {v: k for k, v in FEATURE_INDEX_MAP.items()}

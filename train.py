@@ -191,11 +191,8 @@ def main():
     # ── Step 2: Collect ALL windows for canonical split ──────────────────────
     print("[Phase 2] Streaming all windows and computing canonical split …")
     all_windows = []
-    attack_graphs_for_gnn = []
     for graph, labels in loader.stream_graphs(scaler, csv_files=[CSV_FILES[0]]):
         all_windows.append((graph, labels))
-        if len(attack_graphs_for_gnn) < 100:
-            attack_graphs_for_gnn.append((graph, labels))
 
     if not all_windows:
         logger.error("No windows collected. Check CSV paths in config.py.")
@@ -220,6 +217,13 @@ def main():
 
     all_benign = torch.cat(benign_flows, dim=0)   # [N_total, F]
     logger.info(f"Total benign flows collected (train windows only): {all_benign.shape[0]}")
+
+    # Extract mixed graphs (benign + attack) from train windows for the GNN
+    attack_graphs_for_gnn = []
+    for graph, labels in train_windows:
+        attack_graphs_for_gnn.append((graph, labels))
+        if len(attack_graphs_for_gnn) >= 100:  # Cap at 100 graphs for speed
+            break
 
     # Val split: chronological last 20% of the train-window benign flows
     n_val   = int(len(all_benign) * 0.20)
