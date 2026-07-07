@@ -583,16 +583,11 @@ def load_attack_corruption_profiles() -> dict:
     """
     stats_path = MODELS_DIR / "attack_class_stats.json"
     if not stats_path.exists():
-        import sys
-        main_script = sys.argv[0] if sys.argv else ""
-        if "train_explainer.py" in main_script or "train.py" in main_script:
-            _cfg_log.warning("[CONFIG] attack_class_stats.json not found, but allowing build script to proceed.")
-            return _SENTINEL_ATTACK_PROFILES
-
         raise FileNotFoundError(
             "[CONFIG] attack_class_stats.json NOT FOUND. "
             "Channel 2 federation requires real data-derived profiles. "
-            "Run: python scripts/train_explainer.py before benchmarking."
+            "Run: python scripts/train_explainer.py before benchmarking. "
+            f"Expected path: {stats_path.resolve()}"
         )
 
     try:
@@ -652,3 +647,29 @@ def load_attack_corruption_profiles() -> dict:
 # Resolved at import time — derived from NF-UNSW-NB15-v3 via attack_class_stats.json.
 # Falls back to sentinel profiles with WARNING if the JSON is absent.
 ATTACK_CORRUPTION_PROFILES: dict = load_attack_corruption_profiles()
+
+
+def preflight_dc_fltrust_check():
+    """Call at the top of any script using DC-FLTrust before round 1."""
+    import os, json
+    from datetime import datetime
+    
+    stats_path = MODELS_DIR / "attack_class_stats.json"
+    
+    if not stats_path.exists():
+        raise RuntimeError(
+            f"[PREFLIGHT FAIL] attack_class_stats.json missing at {stats_path}. "
+            "Run train_explainer.py first."
+        )
+    
+    mtime = os.path.getmtime(stats_path)
+    mtime_str = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+    
+    with open(stats_path) as f:
+        profiles = json.load(f)
+    
+    print(f"[PREFLIGHT PASS] attack_class_stats.json found.")
+    print(f"  Modified: {mtime_str}")
+    print(f"  Attack classes present: {list(profiles.keys())}")
+    print(f"  This timestamp should match your most recent train_explainer.py run.")
+    return True

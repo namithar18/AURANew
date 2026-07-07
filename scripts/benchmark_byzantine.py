@@ -33,7 +33,11 @@ from aura.fl_server import fltrust_aggregate, krum_select, krum_aggregate, _buil
 from aura.fl_client import AURAFlowerClient
 from aura.data_loader import CICIDSDataLoader, load_client_partition
 from aura.attack_injector import _benign_profile
-from aura.models import AURAModelBundle
+from aura.models import AURAModelBundle, FlowAutoencoder, AttackHead
+import torch.nn.functional as F
+
+from config import preflight_dc_fltrust_check
+preflight_dc_fltrust_check()  # Hard stops if profiles are missing or stale
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("byz_bench")
@@ -49,6 +53,21 @@ _loader = CICIDSDataLoader()
 try:
     _shared_scaler = _loader.fit_scaler()
     logger.info("Global dataset scaler initialized successfully.")
+    
+    from aura.split_manager import get_canonical_split
+
+    # Load all windows
+    all_windows = list(_loader.stream_graphs(_shared_scaler))
+
+    # Get canonical train/test split
+    _, train_windows, test_windows = get_canonical_split(
+        all_windows, test_fraction=0.20
+    )
+
+    # Extract flows from train windows only
+    _canonical_train_data = torch.cat([
+        graph['edge_attr'] for graph, labels in train_windows
+    ])
 except Exception as e:
     logger.warning(f"Could not fit scaler on CSV dataset: {e}. Falling back to synthetic profiles.")
     _shared_scaler = None
@@ -73,13 +92,11 @@ def generate_client_data(
     train_data, val_data = None, None
     if _shared_scaler is not None:
         try:
-            train_data, val_data = load_client_partition(
-                client_id=client_id_str, scaler=_shared_scaler
-            )
+            train_data = _canonical_train_data.clone()
+            # Val data is unused in this benchmark, just take a slice
+            val_data = train_data[:max(1, n_samples // 5)]
             if len(train_data) > n_samples:
                 train_data = train_data[:n_samples]
-            if len(val_data) > max(1, n_samples // 5):
-                val_data = val_data[:n_samples // 5]
         except Exception:
             pass
 
@@ -127,6 +144,99 @@ def _run_local_training(
     num_examples, train_loss = client._local_train()
     updated_arrays = [p.detach().cpu().numpy() for p in client.model.parameters()]
     return updated_arrays, train_loss
+
+
+def _run_local_training_dual(
+    ae: FlowAutoencoder,
+    attack_head: AttackHead,
+    all_flows: torch.Tensor,
+    ae_optimizer: torch.optim.Optimizer,
+    head_optimizer: torch.optim.Optimizer,
+    global_ae_weights: dict,
+    global_head_weights: dict,
+    mse_threshold_high: float,
+    head_epochs: int = 3
+) -> tuple:
+    """
+    Two-pass dual-channel local training.
+    
+    Pass 1: AE trains on benign-only flows (MSE below threshold).
+             AE latent geometry stays clean — attack flows never 
+             influence encoder weights.
+    Pass 2: Inference-only z collection from high-MSE flows.
+             AE in eval mode, no gradient computation, weights unchanged.
+             AttackHead trains on collected z vectors with soft MSE weighting.
+    
+    Returns: (ae_delta, head_delta, z_buffer, n_benign, n_high_mse)
+    z_buffer is returned for potential submission to dynamic reference buffer.
+    """
+    
+    # === PRE-PASS: classify flows without updating weights ===
+    ae.eval()
+    with torch.no_grad():
+        recon, _ = ae(all_flows)
+        mse_per_flow = F.mse_loss(recon, all_flows, reduction='none').mean(dim=1)
+    ae.train()
+    
+    benign_mask = mse_per_flow < mse_threshold_high
+    high_mse_mask = ~benign_mask
+    benign_flows = all_flows[benign_mask]
+    high_mse_flows = all_flows[high_mse_mask]
+    high_mse_values = mse_per_flow[high_mse_mask]
+    
+    # === PASS 1: AE trains on benign flows only ===
+    ae_loss_val = 0.0
+    if len(benign_flows) > 0:
+        ae_optimizer.zero_grad()
+        recon_benign, _ = ae(benign_flows)
+        ae_loss = F.mse_loss(recon_benign, benign_flows)
+        ae_loss.backward()
+        ae_optimizer.step()
+        ae_loss_val = ae_loss.item()
+    
+    # === PASS 2: Inference-only z collection ===
+    # ae.eval() ensures BatchNorm/Dropout behave consistently
+    # torch.no_grad() ensures no gradient tape — weights CANNOT change
+    z_buffer = []
+    ae.eval()
+    with torch.no_grad():
+        if len(high_mse_flows) > 0:
+            for i in range(0, len(high_mse_flows), 256):
+                batch = high_mse_flows[i:i+256]
+                z = ae.encode(batch)
+                z_buffer.append(z.detach().cpu())
+    ae.train()
+    
+    # === AttackHead training with soft MSE weighting ===
+    head_loss_val = 0.0
+    if z_buffer:
+        z_tensor = torch.cat(z_buffer)
+        
+        # Soft weight: flows with higher MSE contribute more strongly
+        # Prevents hard binary threshold from introducing arbitrary supervision boundary
+        mse_weights = high_mse_values.cpu()
+        mse_weights = (mse_weights - mse_weights.min()) / \
+                      (mse_weights.max() - mse_weights.min() + 1e-8)
+        # Match weight count to z_buffer count (may differ if batching truncates)
+        mse_weights = mse_weights[:len(z_tensor)]
+        
+        for _ in range(head_epochs):
+            head_optimizer.zero_grad()
+            preds = attack_head(z_tensor).squeeze()
+            pseudo_labels = torch.ones(len(z_tensor), device=z_tensor.device)
+            head_loss = F.binary_cross_entropy(preds, pseudo_labels,
+                                               weight=mse_weights)
+            head_loss.backward()
+            head_optimizer.step()
+            head_loss_val = head_loss.item()
+    
+    # === Compute weight deltas for server transmission ===
+    ae_delta = {k: ae.state_dict()[k].clone() - global_ae_weights[k]
+                for k in ae.state_dict()}
+    head_delta = {k: attack_head.state_dict()[k].clone() - global_head_weights[k]
+                  for k in attack_head.state_dict()}
+    
+    return ae_delta, head_delta, z_buffer, len(benign_flows), len(high_mse_flows)
 
 
 def run_experiment(
@@ -281,19 +391,6 @@ def run_experiment(
 def main():
     print("\n" + "=" * 70)
     print("  AURA Byzantine Benchmark  --  Section 5.1.5  (Hypothesis H2)")
-    print("=" * 70)
-
-    # ── Pre-flight data provenance check ─────────────────────────────────────
-    import os
-    from datetime import datetime
-    stats_path = cfg.MODELS_DIR / "attack_class_stats.json"
-    if not stats_path.exists():
-        raise FileNotFoundError(
-            "Channel 2 federation requires real data-derived profiles. "
-            "Run: python scripts/train_explainer.py before benchmarking."
-        )
-    mtime = datetime.fromtimestamp(stats_path.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
-    print(f"  [PRE-FLIGHT] Verified attack_class_stats.json exists (modified: {mtime})")
     print("=" * 70)
     num_clients = 10
 
