@@ -211,6 +211,35 @@ CONFIDENCE_MED_THRESHOLD  = 0.70   # Below this: throttle + HITL
 # Above MED_THRESHOLD → full isolation for non-critical nodes
 
 # ─────────────────────────────────────────────────────────────────────────────
+# HITL THREE-TIER ESCALATION THRESHOLDS (Section 3.5)
+# Every number from the Section 3.5 table is a named constant here.
+# Zero magic numbers in any benchmark or engine script.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# "3 LOWs within 5-min window" → MEDIUM (Section 3.5 trigger, row 2)
+HITL_LOW_TO_MEDIUM_THRESHOLD  = 3
+
+# "3 MEDIUMs within window" → HIGH (Section 3.5 trigger, row 3, second condition)
+HITL_MEDIUM_TO_HIGH_THRESHOLD = 3
+
+# "5 LOWs within window" → HIGH (Section 3.5 trigger, row 3, first condition)
+HITL_LOW_TO_HIGH_THRESHOLD    = 5
+
+# Seconds to wait for operator approval before degrading to auto-throttle (DEGRADED tier)
+HITL_TIMEOUT_SEC              = 30
+
+# Simulated operator approval probability for benchmark_hitl_response.py only [0.0, 1.0].
+# 0.85 means the simulated operator approves 85% of HIGH-tier isolation requests.
+# DEGRADED-tier rate in the benchmark = 1.0 - HITL_APPROVAL_RATE.
+# Never used by the live response engine — only for reproducible offline evaluation.
+HITL_APPROVAL_RATE            = 0.85
+
+# Deduplication window for the response engine (seconds).
+# Duplicate actions on the same node within this window are suppressed.
+# Centralised here so benchmark and live engine use the same constant.
+RESPONSE_DEDUP_WINDOW_SEC     = 30
+
+# ─────────────────────────────────────────────────────────────────────────────
 # BLOCKCHAIN / GANACHE (Immutable Audit Log)
 # ─────────────────────────────────────────────────────────────────────────────
 
