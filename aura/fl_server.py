@@ -346,7 +346,6 @@ def dc_fltrust_aggregate(
                 if client_id < len(round_z_submissions) and round_z_submissions[client_id] is not None:
                     z_submission = round_z_submissions[client_id]
                     if len(z_submission) > 0:
-                        import torch
                         if isinstance(z_submission, list):
                             z_submission = torch.cat(z_submission)
                         attack_ref_buffer.update(
