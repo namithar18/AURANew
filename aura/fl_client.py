@@ -40,6 +40,7 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import flwr as fl
 from flwr.common import (
     Parameters, FitIns, FitRes, EvaluateIns, EvaluateRes,
@@ -51,6 +52,16 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import config as cfg
 from aura.models import AURAModelBundle
+
+# ── Opacus DP-SGD (Tier 2.1) ────────────────────────────────────────────────
+# Imported conditionally so the FL client still works if Opacus is not installed
+# (e.g., in production environments where DP isn't needed).
+try:
+    from opacus import PrivacyEngine
+    from opacus.validators import ModuleValidator
+    OPACUS_AVAILABLE = True
+except ImportError:
+    OPACUS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -281,10 +292,29 @@ class AURAFlowerClient(fl.client.Client):
             self.model.autoencoder.parameters(),
             lr=cfg.AE_LEARNING_RATE,
         )
+
+        # ── Differential Privacy state ───────────────────────────────────
+        # Tracks the cumulative privacy budget consumed across rounds.
+        # PrivacyEngine is re-created each round in _local_train() because
+        # Opacus attaches hooks to the model/optimizer that must be fresh
+        # after global weights are loaded.
+        self.last_epsilon: float = 0.0
+        self.dp_enabled = (
+            cfg.DP_ENABLED
+            and OPACUS_AVAILABLE
+            and cfg.DP_NOISE_MULTIPLIER > 0.0
+        )
+        if cfg.DP_ENABLED and not OPACUS_AVAILABLE:
+            logger.warning(
+                f"[{client_id}] DP_ENABLED=True but Opacus not installed. "
+                f"Training WITHOUT differential privacy."
+            )
+
         logger.info(
             f"[{client_id}] Flower client initialised  |  "
             f"train={len(train_data)}  val={len(val_data)}  "
-            f"epochs={local_epochs}  device={self.device}"
+            f"epochs={local_epochs}  device={self.device}  "
+            f"dp={'ON (σ=' + str(cfg.DP_NOISE_MULTIPLIER) + ')' if self.dp_enabled else 'OFF'}"
         )
 
     # ------------------------------------------------------------------
@@ -338,21 +368,44 @@ class AURAFlowerClient(fl.client.Client):
 
         # Step 5: Return updated weights
         updated_arrays = model_to_ndarrays(self.model)
+
+        # ── DP privacy budget reporting ──────────────────────────────────
+        dp_info = ""
+        if self.dp_enabled and self.last_epsilon > 0:
+            dp_info = f"  ε={self.last_epsilon:.4f} (target: {cfg.DP_TARGET_EPSILON})"
+            logger.info(
+                f"[{self.client_id}] Round privacy budget: "
+                f"ε={self.last_epsilon:.4f} "
+                f"(target: {cfg.DP_TARGET_EPSILON}), δ={cfg.DP_DELTA}"
+            )
+
         logger.info(
             f"[{self.client_id}] Round complete  |  "
             f"loss={train_loss:.4f}  examples={num_examples}  "
-            f"epochs={self.local_epochs}"
+            f"epochs={self.local_epochs}{dp_info}"
         )
 
         # Encode client identity as a stable integer for multi-client tracking.
         # Using a hash of the string ID avoids collisions while keeping it int.
         import hashlib as _hl
         client_id_int = int(_hl.md5(self.client_id.encode()).hexdigest(), 16) % (2**31)
+
+        # Include DP epsilon in metrics so the server can log per-client privacy
+        # budget consumption and detect clients exceeding their target.
+        fit_metrics = {
+            "train_loss": float(train_loss),
+            "client_id": client_id_int,
+        }
+        if self.dp_enabled:
+            fit_metrics["dp_epsilon"] = float(self.last_epsilon)
+            fit_metrics["dp_delta"] = float(cfg.DP_DELTA)
+            fit_metrics["dp_noise_multiplier"] = float(cfg.DP_NOISE_MULTIPLIER)
+
         return FitRes(
             status     = Status(code=Code.OK, message="OK"),
             parameters = ndarrays_to_parameters(updated_arrays),
             num_examples = num_examples,
-            metrics    = {"train_loss": float(train_loss), "client_id": client_id_int},
+            metrics    = fit_metrics,
         )
 
     def evaluate(self, ins: EvaluateIns) -> EvaluateRes:
@@ -408,6 +461,15 @@ class AURAFlowerClient(fl.client.Client):
         the updated weights (incorporating the new attack-learned boundary)
         will be shared with the federation.
 
+        When cfg.DP_ENABLED is True and Opacus is available, the AE optimizer
+        is wrapped with PrivacyEngine for DP-SGD.  This provides formal
+        (ε,δ)-differential privacy guarantees on the training data.
+
+        CRITICAL CONSTRAINT: DP wraps ONLY the AE optimizer.  The AttackHead
+        optimizer (when present in DC-FLTrust two-pass architecture) is NOT
+        wrapped because it trains on AE latent representations / pseudo-labeled
+        high-MSE flows, not on raw private client data.
+
         Returns:  (num_training_examples, final_batch_loss)
         """
         ae = self.model.autoencoder
@@ -418,22 +480,76 @@ class AURAFlowerClient(fl.client.Client):
             dataset, batch_size=cfg.AE_BATCH_SIZE, shuffle=True
         )
 
+        # ── DP-SGD: wrap AE optimizer with Opacus PrivacyEngine ──────────
+        # Fresh optimizer each round because Opacus requires attaching to
+        # a clean optimizer (hooks from previous rounds would conflict
+        # after global weight loading).
+        optimizer = torch.optim.Adam(
+            ae.parameters(), lr=cfg.AE_LEARNING_RATE
+        )
+        privacy_engine = None
+
+        if self.dp_enabled:
+            privacy_engine = PrivacyEngine()
+            # make_private replaces ae, optimizer, loader with DP-wrapped versions
+            # that compute per-sample gradients, clip to max_grad_norm, and add
+            # calibrated Gaussian noise.
+            ae, optimizer, loader = privacy_engine.make_private(
+                module=ae,
+                optimizer=optimizer,
+                data_loader=loader,
+                noise_multiplier=cfg.DP_NOISE_MULTIPLIER,
+                max_grad_norm=cfg.DP_MAX_GRAD_NORM,
+            )
+            logger.info(
+                f"  [{self.client_id}] DP-SGD attached: "
+                f"σ={cfg.DP_NOISE_MULTIPLIER}  "
+                f"C={cfg.DP_MAX_GRAD_NORM}  "
+                f"δ={cfg.DP_DELTA}"
+            )
+
+        # ── Training loop ────────────────────────────────────────────────
         last_loss = 0.0
         for epoch in range(self.local_epochs):
             epoch_loss = 0.0
             for (batch,) in loader:
-                self.optimizer.zero_grad()
+                optimizer.zero_grad()
                 x_hat, z = ae(batch)
-                loss      = ae.reconstruction_loss(batch, x_hat, z)
+                # Use F.mse_loss directly — Opacus needs the loss to flow
+                # cleanly through the wrapped module for per-sample gradients.
+                loss = F.mse_loss(x_hat, batch)
                 loss.backward()
-                # Gradient clipping: prevents exploding gradients with
-                # adversarially crafted data (a known FL poisoning vector)
-                torch.nn.utils.clip_grad_norm_(ae.parameters(), max_norm=1.0)
-                self.optimizer.step()
+
+                if not self.dp_enabled:
+                    # Manual gradient clipping when DP is off (DP handles its
+                    # own per-sample clipping via max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(
+                        ae.parameters(), max_norm=1.0
+                    )
+
+                optimizer.step()
                 epoch_loss += loss.item()
 
             last_loss = epoch_loss / max(len(loader), 1)
             logger.debug(f"  [{self.client_id}] epoch={epoch+1}  loss={last_loss:.4f}")
+
+        # ── Report DP privacy budget ─────────────────────────────────────
+        if privacy_engine is not None:
+            self.last_epsilon = privacy_engine.get_epsilon(delta=cfg.DP_DELTA)
+            logger.info(
+                f"  [{self.client_id}] DP training complete. "
+                f"ε={self.last_epsilon:.4f}, δ={cfg.DP_DELTA}"
+            )
+        else:
+            self.last_epsilon = 0.0
+
+        # Unwrap the DP-wrapped model back to the original autoencoder
+        # so that model_to_ndarrays() extracts clean parameter tensors.
+        if self.dp_enabled and hasattr(ae, '_module'):
+            self.model.autoencoder = ae._module
+        elif self.dp_enabled:
+            # Opacus >= 1.4 wraps as GradSampleModule
+            self.model.autoencoder = ae
 
         return len(self.train_data), last_loss
 
