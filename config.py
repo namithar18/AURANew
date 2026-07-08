@@ -37,6 +37,9 @@ CONTRACTS_DIR = BASE_DIR / "contracts"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
+SPLITS_DIR = BASE_DIR / "splits"
+SPLITS_DIR.mkdir(parents=True, exist_ok=True)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DATASET  (NF-UNSW-NB15-v3)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -53,6 +56,12 @@ BENIGN_LABEL = 0
 
 # Fraction of data to load per CSV (1.0 = all rows; reduce for speed during dev)
 DATA_LOAD_FRACTION = 0.3   # 30 % is enough to demo; use 1.0 for full training
+
+# Fraction of windows held out for test set in canonical split
+TEST_SPLIT_FRACTION = 0.20
+
+# Fraction of train windows used for threshold calibration
+CALIB_SPLIT_FRACTION = 0.10
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GRAPH / TTL EDGE DECAY
@@ -91,7 +100,14 @@ GNN_INPUT_DIM  = FEATURE_DIM
 GNN_HIDDEN_DIM = 64
 GNN_OUTPUT_DIM = 32          # Latent node embedding dimension
 GNN_LEARNING_RATE = 5e-4
-GNN_EPOCHS     = 50
+GNN_EPOCHS        = 50
+
+# Maximum graph windows collected for STGNN training per-phase.
+# Phase 2 seeds the GNN with this many windows from train_windows before
+# Phase 4 streams additional attack CSVs. Both phases cap at this value so
+# changing once here propagates everywhere. 100 is the research-grade default
+# that balances training speed vs. GNN coverage.
+GNN_ATTACK_GRAPH_CAP = 100
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DYNAMIC THRESHOLDING (Exponential Moving Average over batch MSE)
@@ -102,7 +118,7 @@ GNN_EPOCHS     = 50
 EMA_ALPHA = 0.05
 
 # An alert is raised when:  loss > EMA_mean + (EMA_SIGMA_MULTIPLIER × EMA_std)
-EMA_SIGMA_MULTIPLIER = 1.5
+EMA_SIGMA_MULTIPLIER = 3.0
 
 # Warm-up batches before thresholds are active (avoids cold-start false alarms)
 EMA_WARMUP_BATCHES = 50
@@ -118,7 +134,7 @@ TEMPORAL_WINDOW_SECONDS = 300   # 5 minutes — configurable
 # EMA trajectory persistence threshold.
 # K consecutive readings above 2.0σ → MEDIUM floor.
 # K consecutive readings above 2.5σ → HIGH floor.
-K_CONSECUTIVE_READINGS  = 2     # configurable
+K_CONSECUTIVE_READINGS  = 5     # configurable
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -205,6 +221,35 @@ ORG_NETWORK_MAP: dict = {
 CONFIDENCE_LOW_THRESHOLD  = 0.40   # Below this: log only
 CONFIDENCE_MED_THRESHOLD  = 0.70   # Below this: throttle + HITL
 # Above MED_THRESHOLD → full isolation for non-critical nodes
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HITL THREE-TIER ESCALATION THRESHOLDS (Section 3.5)
+# Every number from the Section 3.5 table is a named constant here.
+# Zero magic numbers in any benchmark or engine script.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# "3 LOWs within 5-min window" → MEDIUM (Section 3.5 trigger, row 2)
+HITL_LOW_TO_MEDIUM_THRESHOLD  = 3
+
+# "3 MEDIUMs within window" → HIGH (Section 3.5 trigger, row 3, second condition)
+HITL_MEDIUM_TO_HIGH_THRESHOLD = 3
+
+# "5 LOWs within window" → HIGH (Section 3.5 trigger, row 3, first condition)
+HITL_LOW_TO_HIGH_THRESHOLD    = 5
+
+# Seconds to wait for operator approval before degrading to auto-throttle (DEGRADED tier)
+HITL_TIMEOUT_SEC              = 30
+
+# Simulated operator approval probability for benchmark_hitl_response.py only [0.0, 1.0].
+# 0.85 means the simulated operator approves 85% of HIGH-tier isolation requests.
+# DEGRADED-tier rate in the benchmark = 1.0 - HITL_APPROVAL_RATE.
+# Never used by the live response engine — only for reproducible offline evaluation.
+HITL_APPROVAL_RATE            = 0.85
+
+# Deduplication window for the response engine (seconds).
+# Duplicate actions on the same node within this window are suppressed.
+# Centralised here so benchmark and live engine use the same constant.
+RESPONSE_DEDUP_WINDOW_SEC     = 30
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BLOCKCHAIN / GANACHE (Immutable Audit Log)
