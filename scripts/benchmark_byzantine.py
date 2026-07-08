@@ -13,12 +13,16 @@ Under various Byzantine attack ratios (10%, 20%, 30%, 40%).
 Also includes the rare-client contribution preservation experiment.
 
 NOTE: Runs in-process (no Ray/Flower simulation daemon required).
+
+NOTE: Runs in-process (no Ray/Flower simulation daemon required).
 """
 
 import sys
 import logging
 import hashlib
+import hashlib
 from pathlib import Path
+from typing import List, Tuple
 from typing import List, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -28,7 +32,10 @@ import config as cfg
 import torch
 import torch.nn as nn
 import numpy as np
+import torch.nn as nn
+import numpy as np
 
+from aura.fl_server import fltrust_aggregate, krum_select, krum_aggregate, _build_root_dataset
 from aura.fl_server import fltrust_aggregate, krum_select, krum_aggregate, _build_root_dataset
 from aura.fl_client import AURAFlowerClient
 from aura.data_loader import CICIDSDataLoader, load_client_partition
@@ -42,6 +49,13 @@ preflight_dc_fltrust_check()  # Hard stops if profiles are missing or stale
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("byz_bench")
 
+# Force stdout to UTF-8 so Unicode characters render correctly on Windows
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
+# -----------------------------------------------------------------------------
+# Initialize global scaler once for the entire benchmark run
+# -----------------------------------------------------------------------------
 # Force stdout to UTF-8 so Unicode characters render correctly on Windows
 import io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -75,8 +89,23 @@ try:
         
 except Exception as e:
     logger.warning(f"Could not fit scaler on CSV dataset: {e}. Falling back to synthetic profiles.")
+    logger.warning(f"Could not fit scaler on CSV dataset: {e}. Falling back to synthetic profiles.")
     _shared_scaler = None
 
+
+def generate_client_data(
+    client_idx: int,
+    is_byzantine: bool,
+    is_rare: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Generate local training data for a client.
+
+    - Benign:    real NF-UNSW-NB15-v3 partition (or synthetic benign fallback)
+    - Rare:      benign data with a +0.15 global shift (honest but unusual traffic)
+    - Byzantine: 80% of rows poisoned with DDoS statistical profile from config
+    """
+    n_samples   = 200
 
 def generate_client_data(
     client_idx: int,
@@ -97,14 +126,15 @@ def generate_client_data(
     train_data, val_data = None, None
     if _shared_scaler is not None:
         try:
-            train_data = _canonical_train_data.clone()
-            # Val data is unused in this benchmark, just take a slice
-            val_data = train_data[:max(1, n_samples // 5)]
+            train_data, val_data = load_client_partition(
+                client_id=client_id_str, scaler=_shared_scaler
+            )
             if len(train_data) > n_samples:
                 train_data = train_data[:n_samples]
         except Exception:
             pass
 
+    # Fallback: realistic synthetic benign profile
     # Fallback: realistic synthetic benign profile
     if train_data is None:
         _train_np = _benign_profile(n_samples, feature_dim)
@@ -115,11 +145,17 @@ def generate_client_data(
     if is_rare:
         # Legitimate but distribution-shifted client (e.g., hospital with rare traffic).
         # +0.15 shift simulates higher baseline volume -- still benign direction.
+        # Legitimate but distribution-shifted client (e.g., hospital with rare traffic).
+        # +0.15 shift simulates higher baseline volume -- still benign direction.
         train_data = train_data + 0.15
 
     if is_byzantine:
         # Poison 80% of local batch using real DDoS feature ranges from NF-UNSW-NB15-v3
+        # Poison 80% of local batch using real DDoS feature ranges from NF-UNSW-NB15-v3
         ddos_profile = cfg.ATTACK_CORRUPTION_PROFILES.get("ddos", {})
+        feat_map     = cfg.FEATURE_INDEX_MAP
+        n_attack     = int(len(train_data) * 0.8)
+        attack_rows  = train_data[:n_attack].clone()
         feat_map     = cfg.FEATURE_INDEX_MAP
         n_attack     = int(len(train_data) * 0.8)
         attack_rows  = train_data[:n_attack].clone()
@@ -253,6 +289,27 @@ def _run_local_training_dual(
     return ae_delta, head_delta, z_buffer, len(benign_flows), len(high_mse_flows)
 
 
+
+
+def _run_local_training(
+    client:        AURAFlowerClient,
+    global_arrays: List[np.ndarray],
+) -> Tuple[List[np.ndarray], float]:
+    """
+    One FL round on a single client (in-process, no gRPC needed):
+      1. Load global weights into client's local model.
+      2. Run FL_LOCAL_EPOCHS of unsupervised AE training.
+      3. Return updated weight arrays + training loss.
+    """
+    with torch.no_grad():
+        for p, arr in zip(client.model.parameters(), global_arrays):
+            p.copy_(torch.tensor(arr, dtype=torch.float32))
+
+    num_examples, train_loss = client._local_train()
+    updated_arrays = [p.detach().cpu().numpy() for p in client.model.parameters()]
+    return updated_arrays, train_loss
+
+
 def run_experiment(
     strategy_name:   str,
     num_clients:     int,
@@ -271,7 +328,21 @@ def run_experiment(
     num_clients     : Total clients in the federation (10)
     byzantine_ratio : Fraction of clients that are adversarial (0.1 to 0.4)
     rare_client     : If True, last client gets shifted-but-benign distribution
+    seed            : If set, fixes torch/numpy RNG so runs are comparable
+                       across strategies/ratios (needed for divergence metric).
+
+    Returns
+    -------
+    dict with keys: strategy, byzantine_ratio, num_byzantine, roles,
+    flagged_indices (clients this strategy excluded/flagged, empty for
+    FedAvg since it has no defense), tp/fp/fn/tn and balanced_accuracy for
+    Byzantine-client detection, final_arrays (the resulting global model
+    weights, for computing divergence against a clean baseline), model_hash.
     """
+    if seed is not None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
     logger.info("\n" + "=" * 60)
     logger.info(
         f"Running {strategy_name} | Byzantine Ratio: {byzantine_ratio*100:.0f}% "
@@ -286,8 +357,10 @@ def run_experiment(
     if rare_client and "benign" in roles:
         roles[-1] = "rare"
 
+
     logger.info(f"Client Roles: {roles}")
 
+    # Build clients
     # Build clients
     clients: List[AURAFlowerClient] = []
     for idx in range(num_clients):
@@ -420,6 +493,7 @@ def run_experiment(
                 f"  [FedAvg] All {num_clients} clients contributed equally -- "
                 f"including {num_byzantine} Byzantine (NO FILTER)."
             )
+            flagged_indices = []  # FedAvg has no defense -- never flags anyone
 
         elif strategy_name == "Krum":
             # Distance-based Krum selection
@@ -428,6 +502,7 @@ def run_experiment(
             selected_updates = [client_updates[i] for i in selected_indices]
             new_arrays       = krum_aggregate(selected_updates)
             dropped          = [i for i in range(num_clients) if i not in selected_indices]
+            flagged_indices  = dropped  # unify naming with FLTrust's flagged_indices
             print(f"\n  [Krum] Selected: {selected_indices} | Dropped: {dropped}")
             for i in dropped:
                 print(f"  [Krum] WARNING: Client {i:2d} [{roles[i]}] DROPPED (high Euclidean distance from cluster)")

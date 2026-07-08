@@ -182,13 +182,23 @@ class EMAThresholdTracker:
             self._ema_mean = loss
             self._ema_var  = 0.0
         else:
-            # EMA mean update:  μ_t = α·x_t + (1−α)·μ_{t−1}
-            delta           = loss - self._ema_mean
-            self._ema_mean += self.alpha * delta
+            # Decide BEFORE mutating state: is this reading anomalous
+            # relative to the baseline as it stood prior to this loss?
+            pre_update_threshold = self.threshold
+            triggered_now = (
+                not math.isinf(pre_update_threshold)
+                and loss > pre_update_threshold
+            )
 
-            # EMA variance update (online Welford-style):
-            # σ²_t = (1−α)·(σ²_{t−1} + α·δ²)
-            self._ema_var   = (1 - self.alpha) * (self._ema_var + self.alpha * delta ** 2)
+            if not triggered_now:
+                # Only fold NORMAL readings into the baseline. Otherwise an
+                # attack window drags the EMA mean toward the attack itself,
+                # silently raising the threshold and "erasing" a sustained
+                # attack over just a few windows.
+                delta           = loss - self._ema_mean
+                self._ema_mean += self.alpha * delta
+                self._ema_var   = (1 - self.alpha) * (self._ema_var + self.alpha * delta ** 2)
+            # else: baseline frozen — do not let the attack contaminate normal stats
 
         # ── Trajectory tracking (post-warmup only) ────────────────────────────
         if self.batch_count >= self.warmup_batches and self._ema_mean is not None:
@@ -484,9 +494,15 @@ class AURAInferenceEngine:
         sustained repeated flags within TEMPORAL_WINDOW_SECONDS.
 
         Escalation rules (evaluated per triggered node):
-          low_count >= 3              → escalate to at least MEDIUM
-          low_count >= 5 OR
-          medium_count >= 3           → escalate to HIGH
+          low_count >= cfg.HITL_LOW_TO_MEDIUM_THRESHOLD
+                                 -> escalate to at least MEDIUM
+          low_count >= cfg.HITL_LOW_TO_HIGH_THRESHOLD OR
+          medium_count >= cfg.HITL_MEDIUM_TO_HIGH_THRESHOLD
+                                 -> escalate to HIGH
+
+        Thresholds are read from config.py (Section 3.5 table values).
+        Changing them once in config.py propagates to both the live engine
+        and benchmark_hitl_response.py automatically.
 
         The window is purged of entries older than TEMPORAL_WINDOW_SECONDS
         before evaluation.  After a HIGH severity event, the accumulator for
@@ -515,10 +531,14 @@ class AURAInferenceEngine:
             low_count    = sum(1 for _, sev in window if sev == AlertSeverity.LOW)
             medium_count = sum(1 for _, sev in window if sev == AlertSeverity.MEDIUM)
 
-            # Determine escalation candidate for this node
-            if low_count >= 5 or medium_count >= 3:
+            # Determine escalation candidate for this node.
+            # Thresholds come from cfg (Section 3.5 table) — not hardcoded.
+            if (
+                low_count    >= cfg.HITL_LOW_TO_HIGH_THRESHOLD
+                or medium_count >= cfg.HITL_MEDIUM_TO_HIGH_THRESHOLD
+            ):
                 candidate = AlertSeverity.HIGH
-            elif low_count >= 3:
+            elif low_count >= cfg.HITL_LOW_TO_MEDIUM_THRESHOLD:
                 candidate = AlertSeverity.MEDIUM
             else:
                 candidate = base_severity

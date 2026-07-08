@@ -37,6 +37,9 @@ CONTRACTS_DIR = BASE_DIR / "contracts"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
+SPLITS_DIR = BASE_DIR / "splits"
+SPLITS_DIR.mkdir(parents=True, exist_ok=True)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DATASET  (NF-UNSW-NB15-v3)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -52,7 +55,13 @@ LABEL_COL = "Label"
 BENIGN_LABEL = 0
 
 # Fraction of data to load per CSV (1.0 = all rows; reduce for speed during dev)
-DATA_LOAD_FRACTION = 1.0   # 30 % is enough to demo; use 1.0 for full training
+DATA_LOAD_FRACTION = 0.3   # 30 % is enough to demo; use 1.0 for full training
+
+# Fraction of windows held out for test set in canonical split
+TEST_SPLIT_FRACTION = 0.20
+
+# Fraction of train windows used for threshold calibration
+CALIB_SPLIT_FRACTION = 0.10
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GRAPH / TTL EDGE DECAY
@@ -91,7 +100,14 @@ GNN_INPUT_DIM  = FEATURE_DIM
 GNN_HIDDEN_DIM = 64
 GNN_OUTPUT_DIM = 32          # Latent node embedding dimension
 GNN_LEARNING_RATE = 5e-4
-GNN_EPOCHS     = 50
+GNN_EPOCHS        = 50
+
+# Maximum graph windows collected for STGNN training per-phase.
+# Phase 2 seeds the GNN with this many windows from train_windows before
+# Phase 4 streams additional attack CSVs. Both phases cap at this value so
+# changing once here propagates everywhere. 100 is the research-grade default
+# that balances training speed vs. GNN coverage.
+GNN_ATTACK_GRAPH_CAP = 100
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DYNAMIC THRESHOLDING (Exponential Moving Average over batch MSE)
@@ -105,7 +121,7 @@ EMA_ALPHA = 0.05
 EMA_SIGMA_MULTIPLIER = 3.0
 
 # Warm-up batches before thresholds are active (avoids cold-start false alarms)
-EMA_WARMUP_BATCHES = 5
+EMA_WARMUP_BATCHES = 50
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SEVERITY ENGINE — Temporal Accumulator + EMA Trajectory
@@ -171,7 +187,7 @@ CH2_REF_BUFFER_MIN = 20         # minimum z vectors before dynamic reference act
 # Trust score at or below this value causes the client to be flagged as Byzantine
 # in the detection log (fed into Upgrade 3).  ReLU already zeroes negatives;
 # this threshold lets you also zero out near-zero trust scores from noisy clients.
-FLTRUST_MIN_TRUST_SCORE = 0.05   # 0.0 = ReLU only (strict); raise to e.g. 0.05 to be stricter
+FLTRUST_MIN_TRUST_SCORE = 0.0   # 0.0 = ReLU only (strict); raise to e.g. 0.05 to be stricter
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RESPONSE ENGINE — Critical Infrastructure Allowlist
@@ -205,6 +221,35 @@ ORG_NETWORK_MAP: dict = {
 CONFIDENCE_LOW_THRESHOLD  = 0.40   # Below this: log only
 CONFIDENCE_MED_THRESHOLD  = 0.70   # Below this: throttle + HITL
 # Above MED_THRESHOLD → full isolation for non-critical nodes
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HITL THREE-TIER ESCALATION THRESHOLDS (Section 3.5)
+# Every number from the Section 3.5 table is a named constant here.
+# Zero magic numbers in any benchmark or engine script.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# "3 LOWs within 5-min window" → MEDIUM (Section 3.5 trigger, row 2)
+HITL_LOW_TO_MEDIUM_THRESHOLD  = 3
+
+# "3 MEDIUMs within window" → HIGH (Section 3.5 trigger, row 3, second condition)
+HITL_MEDIUM_TO_HIGH_THRESHOLD = 3
+
+# "5 LOWs within window" → HIGH (Section 3.5 trigger, row 3, first condition)
+HITL_LOW_TO_HIGH_THRESHOLD    = 5
+
+# Seconds to wait for operator approval before degrading to auto-throttle (DEGRADED tier)
+HITL_TIMEOUT_SEC              = 30
+
+# Simulated operator approval probability for benchmark_hitl_response.py only [0.0, 1.0].
+# 0.85 means the simulated operator approves 85% of HIGH-tier isolation requests.
+# DEGRADED-tier rate in the benchmark = 1.0 - HITL_APPROVAL_RATE.
+# Never used by the live response engine — only for reproducible offline evaluation.
+HITL_APPROVAL_RATE            = 0.85
+
+# Deduplication window for the response engine (seconds).
+# Duplicate actions on the same node within this window are suppressed.
+# Centralised here so benchmark and live engine use the same constant.
+RESPONSE_DEDUP_WINDOW_SEC     = 30
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BLOCKCHAIN / GANACHE (Immutable Audit Log)
@@ -394,11 +439,6 @@ def load_ae_thresholds() -> tuple[float, float, bool]:
     to proceed on sentinel values rather than silently using them.
     """
     if not _CALIB_JSON_PATH.exists():
-        import sys
-        if any("calibrate_thresholds" in arg for arg in sys.argv):
-            _cfg_log.warning("[CONFIG] calibration_results.json missing, but running calibration script. Using dummy thresholds to boot.")
-            return 0.7, 0.4
-            
         msg = (
             "[CONFIG] ⚠️  logs/calibration_results.json NOT FOUND. "
             "Falling back to SENTINEL AE thresholds so config.py can still be "

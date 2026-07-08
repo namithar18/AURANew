@@ -47,10 +47,6 @@ import os
 import sys
 from pathlib import Path
 
-# Force UTF-8 encoding for stdout to prevent crashes when printing emojis on Windows
-if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8')
-
 import numpy as np
 import torch
 
@@ -60,7 +56,8 @@ sys.path.insert(0, str(ROOT))
 
 import config as cfg
 from aura.models import FlowAutoencoder
-from aura.data_loader import CICIDSDataLoader
+from aura.data_loader import CICIDSDataLoader, CSV_FILES
+from aura.split_manager import get_canonical_split
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("calibrate")
@@ -68,7 +65,7 @@ log = logging.getLogger("calibrate")
 # ── Constants ─────────────────────────────────────────────────────────────────
 AE_CHECKPOINT = cfg.MODELS_DIR / "autoencoder_best.pth"
 # The primary dataset for this project: NF-UNSW-NB15-v3
-DATASET_CSV   = str(cfg.CSV_DIR / "NF-UNSW-NB15-v3.csv")
+DATASET_CSV   = "NF-UNSW-NB15-v3.csv"
 
 # How many graph windows to sample for calibration (more = better estimate)
 MAX_CALIBRATION_WINDOWS = 200
@@ -128,30 +125,72 @@ def collect_normal_mse(ae: FlowAutoencoder) -> np.ndarray:
     Stream the NF-UNSW-NB15-v3 dataset through the AE and collect per-flow
     MSE for benign rows only (Label == 0).
 
-    The NF-UNSW-NB15-v3 dataset is the single CSV used throughout the project
-    and contains both benign and attack flows.  Only benign flows are used here
-    to characterise the normal reconstruction-error distribution.
+    Uses get_canonical_split() to obtain the train_windows so that the
+    BenignFeatureStats and MSE percentiles are computed STRICTLY on the
+    training partition.  This satisfies both:
+      - the "known topology" requirement (95th-percentile shift reference
+        must come from a benign reference window inside train_windows), and
+      - strict train/test boundary (no test-set data pollutes calibration).
 
     Returns a flat numpy array of MSE values.
     """
     loader = CICIDSDataLoader(load_fraction=cfg.DATA_LOAD_FRACTION)
-    log.info("Fitting scaler on NF-UNSW-NB15-v3 data …")
-    scaler = loader.fit_scaler()
 
+    # ── Step 1: Stream all windows and derive the canonical split ────────────
+    log.info("Streaming all windows to determine canonical train split …")
+    all_windows = []
+    for graph, labels in loader.stream_graphs(
+        loader.fit_scaler(), csv_files=[CSV_FILES[0]]
+    ):
+        all_windows.append((graph, labels))
+
+    if not all_windows:
+        log.error("No windows collected. Check CSV paths in config.py.")
+        return np.array([], dtype=np.float32)
+
+    # get_canonical_split saves indices to splits/canonical_split.npz and
+    # reloads them on subsequent runs — same split as train.py and
+    # benchmark_ablation.py.
+    _, train_windows, _ = get_canonical_split(all_windows, test_fraction=cfg.TEST_SPLIT_FRACTION)
+
+    log.info(
+        f"Canonical split: {len(train_windows)} train windows / "
+        f"{len(all_windows) - len(train_windows)} test windows."
+    )
+
+    # ── Step 2: Fit scaler strictly on train_windows benign flows ────────────
+    # Collect flat benign feature matrix from train_windows only
+    train_benign_tensors = [
+        graph["edge_attr"][labels == 0]
+        for graph, labels in train_windows
+        if (labels == 0).any()
+    ]
+    if not train_benign_tensors:
+        log.error("No benign flows in train windows. Cannot fit scaler.")
+        return np.array([], dtype=np.float32)
+
+    import torch
+    train_benign_X = torch.cat(train_benign_tensors, dim=0).numpy()  # [N, F]
+    from sklearn.preprocessing import MinMaxScaler
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaler.fit(train_benign_X)
+    log.info(f"Scaler fitted strictly on {len(train_benign_X):,} train-partition benign flows.")
+
+    # ── Step 3: Compute MSE over train_windows only ──────────────────────────
     all_mse = []
     windows_processed = 0
 
-    log.info(f"Streaming benign windows from {DATASET_CSV} (max {MAX_CALIBRATION_WINDOWS}) …")
-    for graph, labels in loader.stream_graphs(scaler, csv_files=[cfg.CSV_DIR / DATASET_CSV]):
-        # Only use edges labelled benign (label=0) — pure normal traffic
-        edge_attr = graph["edge_attr"]    # [E, F]
+    log.info(f"Computing MSE on train_windows (max {MAX_CALIBRATION_WINDOWS}) …")
+    for graph, labels in train_windows:
+        # Only benign edges — pure normal reconstruction error
+        edge_attr   = graph["edge_attr"]   # [E, F]
         benign_mask = (labels == 0)
 
         if benign_mask.sum() == 0:
             continue
 
-        x_benign = edge_attr[benign_mask]   # [E', F]
-        mse = ae.anomaly_score(x_benign)    # [E']  — no_grad inside
+        x_benign = edge_attr[benign_mask]              # [E', F]
+        mse      = ae.anomaly_score(x_benign)          # [E']  — no_grad inside
         all_mse.extend(mse.cpu().numpy().tolist())
 
         windows_processed += 1
@@ -159,7 +198,7 @@ def collect_normal_mse(ae: FlowAutoencoder) -> np.ndarray:
             break
 
     all_mse = np.array(all_mse, dtype=np.float32)
-    log.info(f"Collected {len(all_mse):,} MSE samples from {windows_processed} windows.")
+    log.info(f"Collected {len(all_mse):,} MSE samples from {windows_processed} train windows.")
     return all_mse
 
 

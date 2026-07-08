@@ -201,7 +201,7 @@ def main():
     # Use the canonical split so train.py and benchmark_ablation.py see
     # identical train/test partitions.  The split is saved to
     # splits/canonical_split.npz and reloaded on every subsequent run.
-    _, train_windows, _ = get_canonical_split(all_windows, test_fraction=0.20)
+    _, train_windows, _ = get_canonical_split(all_windows, test_fraction=cfg.TEST_SPLIT_FRACTION)
 
     # Extract edge-level benign flows from the canonical *train* windows only.
     # Never include flows from the test windows in the AE training set.
@@ -218,15 +218,16 @@ def main():
     all_benign = torch.cat(benign_flows, dim=0)   # [N_total, F]
     logger.info(f"Total benign flows collected (train windows only): {all_benign.shape[0]}")
 
-    # Extract mixed graphs (benign + attack) from train windows for the GNN
+    # Extract mixed graphs (benign + attack) from train windows for the GNN.
+    # Built from train_windows only — test windows never touch training logic.
     attack_graphs_for_gnn = []
     for graph, labels in train_windows:
         attack_graphs_for_gnn.append((graph, labels))
-        if len(attack_graphs_for_gnn) >= 100:  # Cap at 100 graphs for speed
+        if len(attack_graphs_for_gnn) >= cfg.GNN_ATTACK_GRAPH_CAP:  # Cap from config
             break
 
-    # Val split: chronological last 20% of the train-window benign flows
-    n_val   = int(len(all_benign) * 0.20)
+    # Val split: chronological last TEST_SPLIT_FRACTION of the train-window benign flows
+    n_val   = int(len(all_benign) * cfg.TEST_SPLIT_FRACTION)
     n_train = len(all_benign) - n_val
     train_tensor = all_benign[:n_train]
     val_tensor   = all_benign[n_train:]
@@ -244,7 +245,7 @@ def main():
         for csv_file in CSV_FILES[1:4]:   # Attack-containing CSVs
             for graph, labels in loader.stream_graphs(scaler, csv_files=[csv_file]):
                 attack_graphs_for_gnn.append((graph, labels))
-                if len(attack_graphs_for_gnn) >= 200:
+                if len(attack_graphs_for_gnn) >= cfg.GNN_ATTACK_GRAPH_CAP * 2:
                     break
 
         print(f"[Phase 4] Training AuraSTGNN on {len(attack_graphs_for_gnn)} graphs …")
