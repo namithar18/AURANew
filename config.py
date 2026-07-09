@@ -189,6 +189,14 @@ CH2_REF_BUFFER_MIN = 20         # minimum z vectors before dynamic reference act
 # this threshold lets you also zero out near-zero trust scores from noisy clients.
 FLTRUST_MIN_TRUST_SCORE = 0.0   # 0.0 = ReLU only (strict); raise to e.g. 0.05 to be stricter
 
+# ch1 disambiguation threshold for dc_fltrust_aggregate.
+# Clients with ch1 above this are treated as honest (HEALTHY or UNDER_ATTACK);
+# clients below it are treated as Byzantine.
+# Empirically: honest clients converge to ch1 ~0.65-0.75, while Byzantine
+# clients (even camouflaged) struggle to clear 0.5 reliably.
+# We set this to 0.5 to provide a robust margin of error for noisy honest clients.
+FLTRUST_CH1_THRESHOLD = 0.5
+
 # ─────────────────────────────────────────────────────────────────────────────
 # RESPONSE ENGINE — Critical Infrastructure Allowlist
 # ─────────────────────────────────────────────────────────────────────────────

@@ -76,84 +76,73 @@ try:
         all_windows, test_fraction=0.20
     )
 
-    # Extract flows from train windows only
-    _canonical_train_data = torch.cat([
+    # Extract ALL flows from train windows, randomised once for reproducibility
+    _all_train_flows = torch.cat([
         graph['edge_attr'] for graph, labels in train_windows
     ])
-    
-    def _build_benchmark_root_dataset(n_samples=2000):
-        idx = torch.randperm(len(_canonical_train_data))[:n_samples]
-        return _canonical_train_data[idx]
-        
+    _all_train_flows = _all_train_flows[torch.randperm(len(_all_train_flows))]
+
+    # --- Privacy-preserving partition boundary ---
+    # Root dataset takes the FIRST cfg.FLTRUST_ROOT_SAMPLES rows.
+    # Each client gets a non-overlapping slice from the remainder,
+    # so no client flow ever appears in the server's root dataset.
+    _root_size = cfg.FLTRUST_ROOT_SAMPLES  # e.g. 2000
+    _client_pool = _all_train_flows[_root_size:]  # everything after root slice
+
+    def _build_benchmark_root_dataset(n_samples=None):
+        """Return the fixed root dataset (first _root_size flows)."""
+        n = n_samples or _root_size
+        return _all_train_flows[:n]
+
+    def _get_client_slice(client_idx: int, num_clients: int) -> torch.Tensor:
+        """Return a non-overlapping slice of the client pool for client_idx."""
+        per_client = len(_client_pool) // num_clients
+        start = client_idx * per_client
+        end   = start + per_client
+        return _client_pool[start:end]
+
 except Exception as e:
-    logger.warning(f"Could not fit scaler on CSV dataset: {e}. Falling back to synthetic profiles.")
-    logger.warning(f"Could not fit scaler on CSV dataset: {e}. Falling back to synthetic profiles.")
-    _shared_scaler = None
+    logger.error(f"FATAL: Could not fit or load scaler on CSV dataset: {e}.")
+    raise RuntimeError(f"Scaler initialization failed: {e}")
 
 
 def generate_client_data(
     client_idx: int,
     is_byzantine: bool,
     is_rare: bool,
+    num_clients: int = 5,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Generate local training data for a client.
+    Generate local training data for a client from the canonical train split.
 
-    - Benign:    real NF-UNSW-NB15-v3 partition (or synthetic benign fallback)
-    - Rare:      benign data with a +0.15 global shift (honest but unusual traffic)
-    - Byzantine: 80% of rows poisoned with DDoS statistical profile from config
-    """
-    n_samples   = 200
+    Each client receives a non-overlapping slice of _client_pool — the portion
+    of the train split that comes after the root dataset reserved slice. This
+    guarantees zero overlap between root dataset and client data.
 
-def generate_client_data(
-    client_idx: int,
-    is_byzantine: bool,
-    is_rare: bool,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    - Benign/rare clients: raw flows from their slice (~100k rows each)
+    - Byzantine client:    same slice, but 80% of rows replaced with DDoS profile
     """
-    Generate local training data for a client.
-
-    - Benign:    real NF-UNSW-NB15-v3 partition (or synthetic benign fallback)
-    - Rare:      benign data with a +0.15 global shift (honest but unusual traffic)
-    - Byzantine: 80% of rows poisoned with DDoS statistical profile from config
-    """
-    n_samples   = 200
     feature_dim = cfg.FEATURE_DIM
-    client_id_str = f"org_test_{client_idx}"
 
-    train_data, val_data = None, None
-    if _shared_scaler is not None:
-        try:
-            train_data, val_data = load_client_partition(
-                client_id=client_id_str, scaler=_shared_scaler
-            )
-            if len(train_data) > n_samples:
-                train_data = train_data[:n_samples]
-        except Exception:
-            pass
+    # Real data: non-overlapping slice from canonical train split
+    train_data = _get_client_slice(client_idx, num_clients)
+    val_size   = max(1, len(train_data) // 5)
+    val_data   = train_data[:val_size]
+    train_data = train_data[val_size:]  # train is the remaining 80%
 
-    # Fallback: realistic synthetic benign profile
-    # Fallback: realistic synthetic benign profile
-    if train_data is None:
-        _train_np = _benign_profile(n_samples, feature_dim)
-        _val_np   = _benign_profile(max(1, n_samples // 5), feature_dim)
-        train_data = torch.tensor(_train_np, dtype=torch.float32)
-        val_data   = torch.tensor(_val_np,   dtype=torch.float32)
+    logger.info(
+        f"[generate_client_data] Client {client_idx}: "
+        f"train={len(train_data)} flows, val={len(val_data)} flows"
+    )
 
     if is_rare:
-        # Legitimate but distribution-shifted client (e.g., hospital with rare traffic).
-        # +0.15 shift simulates higher baseline volume -- still benign direction.
-        # Legitimate but distribution-shifted client (e.g., hospital with rare traffic).
-        # +0.15 shift simulates higher baseline volume -- still benign direction.
+        # Legitimate but distribution-shifted client (e.g. hospital with rare traffic).
+        # +0.15 global shift simulates higher baseline volume — still benign direction.
         train_data = train_data + 0.15
 
     if is_byzantine:
-        # Poison 80% of local batch using real DDoS feature ranges from NF-UNSW-NB15-v3
-        # Poison 80% of local batch using real DDoS feature ranges from NF-UNSW-NB15-v3
+        # Poison 80% of local batch using DDoS feature ranges from NF-UNSW-NB15-v3
         ddos_profile = cfg.ATTACK_CORRUPTION_PROFILES.get("ddos", {})
-        feat_map     = cfg.FEATURE_INDEX_MAP
-        n_attack     = int(len(train_data) * 0.8)
-        attack_rows  = train_data[:n_attack].clone()
         feat_map     = cfg.FEATURE_INDEX_MAP
         n_attack     = int(len(train_data) * 0.8)
         attack_rows  = train_data[:n_attack].clone()
@@ -359,8 +348,7 @@ def run_experiment(
 
     logger.info(f"Client Roles: {roles}")
 
-    # Build clients
-    # Build clients
+    # Build clients — each gets a non-overlapping slice of the train split
     clients: List[AURAFlowerClient] = []
     for idx in range(num_clients):
         role = roles[idx]
@@ -368,11 +356,12 @@ def run_experiment(
             idx,
             is_byzantine=(role == "byzantine"),
             is_rare=(role == "rare"),
+            num_clients=num_clients,
         )
         clients.append(AURAFlowerClient(f"client_{idx}", train_data, val_data))
 
     # Shared global model
-    import os, torch, torch.nn.functional as F
+    import os
     global_model  = AURAModelBundle()
     
     # Load pretrained AE weights
@@ -607,7 +596,8 @@ def run_experiment(
                     round_z_submissions=round_z_submissions,
                     attack_ref_buffer=attack_ref_buffer,
                     current_round=rnd,
-                    reference_attack_head=global_model.attack_head
+                    reference_attack_head=global_model.attack_head,
+                    ch1_threshold=cfg.FLTRUST_CH1_THRESHOLD
                 )
                 trust_scores = ch1_scores
 

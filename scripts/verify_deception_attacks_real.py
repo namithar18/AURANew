@@ -225,7 +225,8 @@ def run_benchmark(train_benign, train_attack, mode, attack_mode, rounds, seed):
                     g_head_w[k] += agg_head[k]
         else:
             agg_ae, agg_head, ch1, ch2, classes = dc_fltrust_aggregate(
-                c_ae_deltas, c_head_deltas, r_ae_delta, r_head_delta, client_round_counts, ch2_warmup_rounds=0
+                c_ae_deltas, c_head_deltas, r_ae_delta, r_head_delta, client_round_counts,
+                ch2_warmup_rounds=0, ch1_threshold=cfg.FLTRUST_CH1_THRESHOLD
             )
             ch1_history.append(ch1[0])
             ch2_history.append(ch2[0] if ch2[0] is not None else 0.0)
@@ -295,51 +296,55 @@ def main():
     print(f"[Diagnostic] Mean MSE for attack flows: {mse_a:.6f}\n")
     
     all_results = {}
-    for seed in [0, 1, 2]:
-        all_results[seed] = run_single_seed_sequential(
-            seed=seed,
-            modes=['ae_only', 'joint_dual', 'dc_fltrust'],
-            attack_mode='latent_inversion',
-            rounds=5,
-            x_benign=x_benign, x_attack=x_attack,
-            train_benign=train_benign, train_attack=train_attack
-        )
-        for mode in ['ae_only', 'joint_dual', 'dc_fltrust']:
-            print(f"Seed {seed}, Mode {mode}: Raw AUROC={all_results[seed][mode]['auroc']:.4f}")
-            
-    # Baseline assertion (dc_fltrust handles the attack perfectly, so it serves as baseline)
-    baseline_aurocs = [all_results[s]['dc_fltrust']['auroc'] for s in [0, 1, 2]]
-    baseline_auroc_std = np.std(baseline_aurocs)
-    baseline_auroc_mean = np.mean(baseline_aurocs)
-    
-    print("\n" + "="*40)
-    if baseline_auroc_std < 0.05 and baseline_auroc_mean > 0.70:
-        print(f"PASS: Baseline AUROC={baseline_auroc_mean:.4f} ± {baseline_auroc_std:.4f}")
-        print("Numbers are suitable for paper reporting.")
-    else:
-        print(f"FAIL: Baseline AUROC={baseline_auroc_mean:.4f} ± {baseline_auroc_std:.4f}")
-        print("Either std is > 0.05 or mean is < 0.70.")
+    attacks = ['latent_inversion', 'true_labelflip']
+    for attack in attacks:
+        all_results[attack] = {}
+        for seed in [0, 1, 2]:
+            all_results[attack][seed] = run_single_seed_sequential(
+                seed=seed,
+                modes=['ae_only', 'joint_dual', 'dc_fltrust'],
+                attack_mode=attack,
+                rounds=5,
+                x_benign=x_benign, x_attack=x_attack,
+                train_benign=train_benign, train_attack=train_attack
+            )
+            for mode in ['ae_only', 'joint_dual', 'dc_fltrust']:
+                print(f"Attack {attack}, Seed {seed}, Mode {mode}: Raw AUROC={all_results[attack][seed][mode]['auroc']:.4f}")
+                
+    for attack in attacks:
+        baseline_aurocs = [all_results[attack][s]['dc_fltrust']['auroc'] for s in [0, 1, 2]]
+        baseline_auroc_std = np.std(baseline_aurocs)
+        baseline_auroc_mean = np.mean(baseline_aurocs)
         
-    print("\n--- Final Paper Stats ---")
-    la_auroc = np.mean([all_results[s]['ae_only']['auroc'] for s in [0,1,2]])
-    lb_auroc = np.mean([all_results[s]['joint_dual']['auroc'] for s in [0,1,2]])
-    lc_auroc = baseline_auroc_mean
-    
-    lc_ch1 = np.mean([all_results[s]['dc_fltrust']['ch1'] for s in [0,1,2]])
-    lc_ch1_std = np.std([all_results[s]['dc_fltrust']['ch1'] for s in [0,1,2]])
-    lc_ch2 = np.mean([all_results[s]['dc_fltrust']['ch2'] for s in [0,1,2]])
-    lc_ch2_std = np.std([all_results[s]['dc_fltrust']['ch2'] for s in [0,1,2]])
-    
-    lb_comb = np.mean([all_results[s]['joint_dual']['combined_weight'] for s in [0,1,2]])
-    lb_head = np.mean([all_results[s]['joint_dual']['head_weight'] for s in [0,1,2]])
-    
-    print(f"Latent Inversion ch1: {lc_ch1:.4f} ± {lc_ch1_std:.4f}")
-    print(f"Latent Inversion ch2: {lc_ch2:.4f} ± {lc_ch2_std:.4f}")
-    print(f"Mode B combined trust weight: {lb_comb:.4f}")
-    print(f"Mode B head inclusion weight: {lb_head:.4f}")
-    print(f"Mode C (Baseline) AUROC: {lc_auroc:.4f} ± {baseline_auroc_std:.4f}")
-    print(f"Mode A (AE-only) AUROC: {la_auroc:.4f}")
-    print(f"Mode B (Joint_Dual) AUROC: {lb_auroc:.4f}")
+        print("\n" + "="*40)
+        print(f"Stats for {attack}")
+        if baseline_auroc_std < 0.05 and baseline_auroc_mean > 0.70:
+            print(f"PASS: Baseline AUROC={baseline_auroc_mean:.4f} ± {baseline_auroc_std:.4f}")
+            print("Numbers are suitable for paper reporting.")
+        else:
+            print(f"FAIL: Baseline AUROC={baseline_auroc_mean:.4f} ± {baseline_auroc_std:.4f}")
+            print("Either std is > 0.05 or mean is < 0.70.")
+            
+        print("\n--- Final Paper Stats ---")
+        la_auroc = np.mean([all_results[attack][s]['ae_only']['auroc'] for s in [0,1,2]])
+        lb_auroc = np.mean([all_results[attack][s]['joint_dual']['auroc'] for s in [0,1,2]])
+        lc_auroc = baseline_auroc_mean
+        
+        lc_ch1 = np.mean([all_results[attack][s]['dc_fltrust']['ch1'] for s in [0,1,2]])
+        lc_ch1_std = np.std([all_results[attack][s]['dc_fltrust']['ch1'] for s in [0,1,2]])
+        lc_ch2 = np.mean([all_results[attack][s]['dc_fltrust']['ch2'] for s in [0,1,2]])
+        lc_ch2_std = np.std([all_results[attack][s]['dc_fltrust']['ch2'] for s in [0,1,2]])
+        
+        lb_comb = np.mean([all_results[attack][s]['joint_dual']['combined_weight'] for s in [0,1,2]])
+        lb_head = np.mean([all_results[attack][s]['joint_dual']['head_weight'] for s in [0,1,2]])
+        
+        print(f"{attack} ch1: {lc_ch1:.4f} ± {lc_ch1_std:.4f}")
+        print(f"{attack} ch2: {lc_ch2:.4f} ± {lc_ch2_std:.4f}")
+        print(f"Mode B combined trust weight: {lb_comb:.4f}")
+        print(f"Mode B head inclusion weight: {lb_head:.4f}")
+        print(f"Mode C (Baseline) AUROC: {lc_auroc:.4f} ± {baseline_auroc_std:.4f}")
+        print(f"Mode A (AE-only) AUROC: {la_auroc:.4f}")
+        print(f"Mode B (Joint_Dual) AUROC: {lb_auroc:.4f}")
 
 if __name__ == "__main__":
     main()

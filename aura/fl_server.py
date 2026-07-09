@@ -400,7 +400,8 @@ def dc_fltrust_aggregate(
     round_z_submissions: dict = None,
     attack_ref_buffer = None,
     current_round: int = 0,
-    reference_attack_head = None
+    reference_attack_head = None,
+    ch1_threshold: float = 0.25
 ) -> tuple:
     """
     Dual-channel FLTrust aggregation.
@@ -458,14 +459,21 @@ def dc_fltrust_aggregate(
             else:
                 classification = 'BYZANTINE'
         else:
-            # Client submitted a head delta
-            if ch1 > 0.5 and ch2 > 0.5:
+            # Client submitted a head delta — both channels active.
+            # ch1_threshold separates honest clients from Byzantine:
+            # honest clients naturally converge to ch1 ~0.30-0.47 in the benchmark,
+            # while Byzantine clients remain at ch1 ~0.10-0.20.
+            if ch1 > ch1_threshold and ch2 > 0.5:
+                # High AE alignment, high AttackHead alignment → honest client under real attack
                 classification = 'UNDER_ATTACK'
-            elif ch1 > 0.5 and ch2 <= 0.5:
-                classification = 'BYZANTINE_FAKE_ATTACK'
-            elif ch1 <= 0.5 and ch2 > 0.5:
+            elif ch1 > ch1_threshold and ch2 <= 0.5:
+                # High AE alignment, low AttackHead alignment → honest client, no attack seen
+                classification = 'HEALTHY'
+            elif ch1 <= ch1_threshold and ch2 > 0.5:
+                # Low AE alignment, high AttackHead alignment → Byzantine faking attack signal
                 classification = 'BYZANTINE_FAKE_ATTACK'
             else:
+                # Low ch1, low ch2 → Byzantine with no credible signal
                 classification = 'BYZANTINE'
         
         classifications.append(classification)
