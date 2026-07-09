@@ -181,7 +181,10 @@ def krum_aggregate(
 # Root Dataset (server trusted data for FLTrust)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_root_dataset(n_samples: int = cfg.FLTRUST_ROOT_SAMPLES) -> torch.Tensor:
+def _build_root_dataset(
+    n_samples: int = cfg.FLTRUST_ROOT_SAMPLES,
+    scaler=None,
+) -> torch.Tensor:
     """
     Build the FLTrust server root dataset (trusted benign reference).
 
@@ -189,21 +192,47 @@ def _build_root_dataset(n_samples: int = cfg.FLTRUST_ROOT_SAMPLES) -> torch.Tens
     -------------------------------------------------
     "real" (default for research paper):
       Loads a GLOBALLY REPRESENTATIVE benign sample from NF-UNSW-NB15-v3.
-      It explicitly avoids using specific client partitions to ensure the 
-      server gradient is unbiased, preventing false-positive Byzantine flags 
+      It explicitly avoids using specific client partitions to ensure the
+      server gradient is unbiased, preventing false-positive Byzantine flags
       on honest Non-IID clients.
 
-    "synthetic" (fallback / dataset-unavailable):
-      Gaussian samples in the 0.35–0.50 range.
+    Parameters
+    ----------
+    n_samples : Number of benign samples to include in the root dataset.
+    scaler    : Pre-fitted MinMaxScaler to use for feature normalisation.
+                **CRITICAL — must be the same scaler used by all FL clients.**
+                If None, a new scaler is fitted from scratch on the CSV, which
+                will NOT match the benchmark's shared scaler and will cause
+                systematically low ch1 scores for honest clients (Bug 3).
     """
     if cfg.FL_ROOT_DATA_SOURCE == "real":
         try:
             import pandas as pd
             from aura.data_loader import CICIDSDataLoader, DATASET_PATH
-            
+
             _loader = CICIDSDataLoader()
-            _scaler = _loader.fit_scaler()
-            
+
+            if scaler is not None:
+                # Use the caller-supplied shared scaler — this MUST be the same
+                # scaler used to scale client training data so ch1 cosine
+                # similarities are computed in a consistent feature space.
+                _scaler = scaler
+                logger.info(
+                    "[FLTrust] Using caller-supplied shared scaler for root dataset. "
+                    "(correct path — scaler consistent with client data)"
+                )
+            else:
+                # Fallback: fit a fresh scaler. This is only safe when running
+                # the Flower server standalone (no benchmark context). It will
+                # produce a numerically distinct scaler if DATA_LOAD_FRACTION
+                # or random_state differs from the client path.
+                logger.warning(
+                    "[FLTrust] No shared scaler supplied — fitting root scaler "
+                    "independently. For benchmark runs, pass _shared_scaler to "
+                    "avoid ch1 score collapse."
+                )
+                _scaler = _loader.fit_scaler()
+
             # Load the global CSV directly
             df = _loader._load_csv(str(DATASET_PATH))
             label_col = 'Label' if 'Label' in df.columns else cfg.LABEL_COL.strip()
@@ -216,10 +245,10 @@ def _build_root_dataset(n_samples: int = cfg.FLTRUST_ROOT_SAMPLES) -> torch.Tens
 
             # Sample globally so all org behaviors are represented
             sampled_df = benign_df.sample(n=min(n_samples, len(benign_df)), random_state=42)
-            
+
             X = sampled_df[_loader._feature_cols].values.astype(np.float32)
             X_scaled = _scaler.transform(X).clip(0, 1)
-            
+
             root = torch.tensor(X_scaled, dtype=torch.float32)
 
             # Tile if the available dataset is smaller than requested
@@ -232,7 +261,7 @@ def _build_root_dataset(n_samples: int = cfg.FLTRUST_ROOT_SAMPLES) -> torch.Tens
                 f"({len(root)} unbiased samples)."
             )
             return root
-            
+
         except Exception as e:
             raise RuntimeError(
                 f"FATAL: Real root dataset unavailable. "
@@ -416,67 +445,129 @@ def dc_fltrust_aggregate(
     
     def flatten(delta: dict) -> torch.Tensor:
         return torch.cat([v.flatten() for v in delta.values()])
-    
-    def cosine_trust(client_flat, root_flat) -> float:
-        sim = F.cosine_similarity(
-            client_flat.unsqueeze(0), 
+
+    def signed_cosine(client_flat, root_flat) -> float:
+        """Raw signed cosine similarity — used for CLASSIFICATION decisions.
+
+        Preserves sign so that anti-aligned gradients (negative cosine) are
+        distinguishable from 'no signal' (ch2=None). This is the fix for the
+        Latent Inversion Byzantine escape: a client that trains its AttackHead
+        with inverted labels produces a head delta with raw cosine ≈ −0.4.
+        After ReLU that was 0.0, which was then classified as HEALTHY.
+        With the raw signed value it is correctly caught as BYZANTINE_FAKE_ATTACK.
+        """
+        return F.cosine_similarity(
+            client_flat.unsqueeze(0),
             root_flat.unsqueeze(0)
         ).item()
-        return max(0.0, sim)  # ReLU — negative similarity → zero trust
-    
+
+    def relu_cosine(client_flat, root_flat) -> float:
+        """ReLU-clamped cosine — used for AGGREGATION WEIGHTS only.
+
+        Aggregation weights must be non-negative (a negative weight would
+        invert the gradient direction and corrupt the global model). ReLU
+        maps anti-aligned updates to zero weight, excluding them from the
+        weighted average without needing an explicit exclusion list.
+        """
+        return max(0.0, signed_cosine(client_flat, root_flat))
+
     root_ae_flat = flatten(root_ae_delta)
     root_head_flat = flatten(root_head_delta)
-    
-    ch1_scores = []
-    ch2_scores = []
+
+    ch1_scores = []       # ReLU cosine for ch1 (used in aggregation weights)
+    ch2_scores = []       # ReLU cosine for ch2 (used in aggregation weights)
+    ch2_raw_scores = []   # Signed cosine for ch2 (used in classification only)
     classifications = []
-    
+
     for i, (ae_delta, head_delta, rounds) in enumerate(
         zip(client_ae_deltas, client_head_deltas, client_round_counts)
     ):
-        # Channel 1: always active
-        ch1 = cosine_trust(flatten(ae_delta), root_ae_flat)
-        
+        # Channel 1: always active — ReLU for weight, signed for reference
+        ch1 = relu_cosine(flatten(ae_delta), root_ae_flat)
+
         # Channel 2: gated by warmup
         if rounds >= ch2_warmup_rounds:
             if head_delta is not None:
-                ch2 = cosine_trust(flatten(head_delta), root_head_flat)
+                head_flat = flatten(head_delta)
+                ch2_raw = signed_cosine(head_flat, root_head_flat)   # signed — for classification
+                ch2     = relu_cosine(head_flat, root_head_flat)      # ReLU  — for aggregation weight
             else:
-                ch2 = None  # No attack signal submitted
+                ch2_raw = None   # No attack signal submitted
+                ch2     = None
         else:
-            ch2 = 'WARMUP'  # Special flag for warmup
-        
+            ch2_raw = 'WARMUP'
+            ch2     = 'WARMUP'
+
         ch1_scores.append(ch1)
         ch2_scores.append(ch2 if isinstance(ch2, float) else 0.0)
-        
-        # Classify client based on dual-channel scores
-        if ch2 == 'WARMUP':
+        ch2_raw_scores.append(ch2_raw)
+
+        # ── Classification uses ch2_raw (signed) so anti-aligned Byzantines
+        #    are detected even though their ReLU ch2 == 0.0 ────────────────
+        if ch2_raw == 'WARMUP':
             classification = 'WARMUP'
-        elif ch2 is None:
-            # Client past warmup but didn't submit a head (no attacks seen)
-            if ch1 > 0.5:
+
+        elif ch2_raw is None:
+            # Client past warmup but submitted no head delta (no attack flows seen).
+            # This is the legitimate "healthy, quiet network" case.
+            if ch1 > ch1_threshold:
                 classification = 'HEALTHY'
             else:
                 classification = 'BYZANTINE'
+
         else:
-            # Client submitted a head delta — both channels active.
-            # ch1_threshold separates honest clients from Byzantine:
-            # honest clients naturally converge to ch1 ~0.30-0.47 in the benchmark,
-            # while Byzantine clients remain at ch1 ~0.10-0.20.
-            if ch1 > ch1_threshold and ch2 > 0.5:
-                # High AE alignment, high AttackHead alignment → honest client under real attack
-                classification = 'UNDER_ATTACK'
-            elif ch1 > ch1_threshold and ch2 <= 0.5:
-                # High AE alignment, low AttackHead alignment → honest client, no attack seen
-                classification = 'HEALTHY'
-            elif ch1 <= ch1_threshold and ch2 > 0.5:
-                # Low AE alignment, high AttackHead alignment → Byzantine faking attack signal
-                classification = 'BYZANTINE_FAKE_ATTACK'
+            # ch2_raw is a signed float.  Three regimes matter:
+            #
+            #   ch2_raw > +0.5  → AttackHead aligned with server reference
+            #                     (honest client learning attack patterns)
+            #   -0.1 ≤ ch2_raw ≤ +0.5 → weak or absent alignment
+            #                     (honest client, few/no attack flows)
+            #   ch2_raw < -0.1  → AttackHead ANTI-ALIGNED with server reference
+            #                     (Byzantine Latent Inversion — trains AttackHead
+            #                      with inverted pseudo-labels to suppress detection)
+            #
+            # The -0.1 dead-band prevents random noise near zero from triggering
+            # false BYZANTINE_FAKE_ATTACK classifications.
+
+            ANTI_ALIGN_THRESHOLD = -0.1   # below this → deliberate inversion
+
+            if ch2_raw < ANTI_ALIGN_THRESHOLD:
+                # Anti-aligned AttackHead submitted — Latent Inversion attack.
+                # ch1 may be high (honest AE) but the head is clearly adversarial.
+                if ch1 > ch1_threshold:
+                    # High AE alignment + anti-aligned head → Latent Inversion
+                    classification = 'BYZANTINE_FAKE_ATTACK'
+                else:
+                    # Low ch1 AND anti-aligned head → plain Byzantine
+                    classification = 'BYZANTINE'
+
+            elif ch2_raw > 0.5:
+                if ch1 > ch1_threshold:
+                    # High AE alignment, high AttackHead alignment
+                    # → honest client whose network is under real attack
+                    classification = 'UNDER_ATTACK'
+                else:
+                    # Low AE alignment, high AttackHead alignment
+                    # → Byzantine faking an attack signal to gain ch2 trust
+                    classification = 'BYZANTINE_FAKE_ATTACK'
+
             else:
-                # Low ch1, low ch2 → Byzantine with no credible signal
-                classification = 'BYZANTINE'
-        
+                # ch2_raw in [−0.1, 0.5]: weak or no attack signal
+                if ch1 > ch1_threshold:
+                    # Honest client — AE aligned, AttackHead quiet
+                    classification = 'HEALTHY'
+                else:
+                    # Low ch1 AND weak ch2 → Byzantine with no credible signal
+                    classification = 'BYZANTINE'
+
         classifications.append(classification)
+
+        _ch2r_str = f"{ch2_raw:.4f}" if isinstance(ch2_raw, float) else str(ch2_raw)
+        _ch2_str  = f"{ch2:.4f}"    if isinstance(ch2,     float) else "0.0000"
+        logger.debug(
+            f"  [dc_fltrust] Client {i}: "
+            f"ch1={ch1:.4f}  ch2_raw={_ch2r_str}  ch2_relu={_ch2_str}  -> {classification}"
+        )
     
     # Aggregate AE weights — exclude Byzantine clients from ch1
     ch1_weights = torch.tensor([

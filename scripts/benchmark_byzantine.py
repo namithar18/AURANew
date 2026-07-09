@@ -381,7 +381,7 @@ def run_experiment(
     if _shared_scaler is not None:
         root_data = _build_benchmark_root_dataset()
     else:
-        root_data = _build_root_dataset(2000)
+        root_data = _build_root_dataset(2000, scaler=None)  # standalone fallback only
 
     # Federated rounds
     from aura.attack_reference import AttackReferenceBuffer
