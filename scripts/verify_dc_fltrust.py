@@ -8,6 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from aura.models import FlowAutoencoder, AttackHead
+from aura.attack_reference import AttackReferenceBuffer
 from scripts.benchmark_byzantine import _run_local_training_dual
 from aura.fl_server import ae_only_fltrust_aggregate, joint_dual_fltrust_aggregate, dc_fltrust_aggregate
 
@@ -70,6 +71,7 @@ def run_verify():
     
     c_ae_deltas = []
     c_head_deltas = []
+    round_z_submissions = {}
     
     for i in range(num_clients):
         if i == 2:
@@ -85,17 +87,22 @@ def run_verify():
             # inverted head delta to guarantee 0.0 cosine similarity
             head_delta = {k: -v.clone() for k, v in r_head_delta.items()}
             c_head_deltas.append(head_delta)
+            round_z_submissions[i] = []  # Byzantine submits no z vectors
         else:
             flows = get_flows(i)
-            ae_d, head_d, _, _, _ = run_pass(
+            ae_d, head_d, z_buf, _, _ = run_pass(
                 client_aes[i], client_heads[i], client_ae_opts[i], client_head_opts[i],
                 flows, g_ae_w, g_head_w
             )
             c_ae_deltas.append(ae_d)
             c_head_deltas.append(head_d)
+            round_z_submissions[i] = z_buf  # honest clients submit z for buffer
             
     client_round_counts = [10] * num_clients
     
+    # Dynamic reference buffer — validates Bug 2 (buffer accumulation)
+    attack_ref_buffer = AttackReferenceBuffer(max_size=500, min_size_to_use=10)
+
     # Mode A
     agg_ae_A, trust_scores_A = ae_only_fltrust_aggregate(c_ae_deltas, r_ae_delta)
     
@@ -107,9 +114,13 @@ def run_verify():
     total_B = sum(combined_B)
     c2_weight_B = combined_B[2] / total_B
     
-    # Mode C
+    # Mode C — pass buffer so UNDER_ATTACK z vectors are accumulated
     agg_ae_C, agg_head_C, ch1_C, ch2_C, classes_C = dc_fltrust_aggregate(
-        c_ae_deltas, c_head_deltas, r_ae_delta, r_head_delta, client_round_counts, ch2_warmup_rounds=0
+        c_ae_deltas, c_head_deltas, r_ae_delta, r_head_delta, client_round_counts,
+        ch2_warmup_rounds=0,
+        round_z_submissions=round_z_submissions,
+        attack_ref_buffer=attack_ref_buffer,
+        current_round=1,
     )
     # in Mode C, Client 2 is classified as BYZANTINE_FAKE_ATTACK, so its head is excluded
     c2_weight_C = 0.0
@@ -121,6 +132,18 @@ def run_verify():
     print(f"{'Client 1 trust:':<17} {trust_scores_A[1]:<18.4f} {combined_B[1]:<17.4f} {classes_C[1]:<20}")
     print(f"{'Client 2 trust:':<17} {trust_scores_A[2]:<18.4f} {combined_B[2]:<17.4f} {classes_C[2]:<20}")
     print(f"{'C2 head weight:':<17} {'N/A':<18} {c2_weight_B:<17.4f} {c2_weight_C:<20.1f} (excluded)")
+
+    # Bug 2 verification
+    buf_size = len(attack_ref_buffer._buffer)
+    expected_under_attack = sum(1 for c in classes_C if c == 'UNDER_ATTACK')
+    print(f"\n[Bug 2 Check] UNDER_ATTACK clients: {expected_under_attack}")
+    print(f"[Bug 2 Check] Buffer size after round: {buf_size}")
+    if expected_under_attack > 0 and buf_size > 0:
+        print("[Bug 2 Check] PASS — buffer accumulated z vectors from UNDER_ATTACK clients")
+    elif expected_under_attack == 0:
+        print("[Bug 2 Check] SKIP — no clients classified UNDER_ATTACK in this synthetic run")
+    else:
+        print("[Bug 2 Check] FAIL — UNDER_ATTACK clients present but buffer is empty")
 
 if __name__ == "__main__":
     run_verify()

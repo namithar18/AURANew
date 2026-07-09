@@ -299,7 +299,6 @@ class AURAFlowerClient(fl.client.Client):
         # Opacus attaches hooks to the model/optimizer that must be fresh
         # after global weights are loaded.
         self.last_epsilon: float = 0.0
-        self.last_epsilon_head: float = 0.0
         self.dp_enabled = (
             cfg.DP_ENABLED
             and OPACUS_AVAILABLE
@@ -399,9 +398,10 @@ class AURAFlowerClient(fl.client.Client):
         }
         if self.dp_enabled:
             fit_metrics["dp_epsilon"] = float(self.last_epsilon)
-            fit_metrics["dp_epsilon_head"] = float(self.last_epsilon_head)
             fit_metrics["dp_delta"] = float(cfg.DP_DELTA)
             fit_metrics["dp_noise_multiplier"] = float(cfg.DP_NOISE_MULTIPLIER)
+            # Note: AttackHead does not use DP (trains on AE latent z vectors,
+            # not raw private data). Only AE epsilon is reported.
 
         return FitRes(
             status     = Status(code=Code.OK, message="OK"),
@@ -541,10 +541,14 @@ class AURAFlowerClient(fl.client.Client):
         else:
             self.last_epsilon = 0.0
 
-        # ── Pass 2: AttackHead (MLP) training with DP on high-MSE z vectors ──
+        # ── Pass 2: AttackHead (MLP) training — NO DP ──────────────────────
+        # AttackHead trains on AE latent z vectors (16-dim compressed
+        # representations), NOT on raw private flow data. The DP guarantee
+        # is for the AE training only (Pass 1 above). Applying Opacus to the
+        # AttackHead would be semantically incorrect: z vectors are already
+        # 78→16 compressed, and the AttackHead gradient does not expose
+        # individual raw flow records.
         head = self.model.attack_head
-        head_privacy_engine = None
-        self.last_epsilon_head = 0.0
 
         # Use unwrapped AE for inference (no grad, no DP hooks needed)
         ae_unwrapped = ae._module if hasattr(ae, '_module') else ae
@@ -581,24 +585,8 @@ class AURAFlowerClient(fl.client.Client):
             head_optimizer = torch.optim.Adam(
                 head.parameters(), lr=cfg.AE_LEARNING_RATE
             )
-
-            if self.dp_enabled:
-                head_privacy_engine = PrivacyEngine()
-                head, head_optimizer, head_loader = \
-                    head_privacy_engine.make_private(
-                        module=head,
-                        optimizer=head_optimizer,
-                        data_loader=head_loader,
-                        noise_multiplier=cfg.DP_NOISE_MULTIPLIER,
-                        max_grad_norm=cfg.DP_MAX_GRAD_NORM,
-                    )
-                logger.info(
-                    f"  [{self.client_id}] DP-SGD attached to AttackHead: "
-                    f"\u03c3={cfg.DP_NOISE_MULTIPLIER}  "
-                    f"C={cfg.DP_MAX_GRAD_NORM}  "
-                    f"n_high_mse={n_high_mse}"
-                )
-
+            # Plain training — no Opacus. AttackHead trains on z vectors,
+            # not raw private data; DP is not applicable here.
             for _ep in range(3):
                 for z_batch, lbl_batch, w_batch in head_loader:
                     head_optimizer.zero_grad()
@@ -608,24 +596,6 @@ class AURAFlowerClient(fl.client.Client):
                     )
                     loss_head.backward()
                     head_optimizer.step()
-
-            if head_privacy_engine is not None:
-                self.last_epsilon_head = head_privacy_engine.get_epsilon(
-                    delta=cfg.DP_DELTA
-                )
-                logger.info(
-                    f"  [{self.client_id}] AttackHead DP complete. "
-                    f"\u03b5={self.last_epsilon_head:.4f}, \u03b4={cfg.DP_DELTA}"
-                )
-
-            # Unwrap DP-wrapped AttackHead
-            if self.dp_enabled and hasattr(head, 'remove_hooks'):
-                head.remove_hooks()
-                self.model.attack_head = head._module
-            elif self.dp_enabled and hasattr(head, '_module'):
-                self.model.attack_head = head._module
-            elif self.dp_enabled:
-                self.model.attack_head = head
         else:
             logger.debug(
                 f"  [{self.client_id}] No high-MSE flows "

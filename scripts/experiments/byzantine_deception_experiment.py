@@ -186,3 +186,42 @@ def _run_true_labelflip_byzantine(
         head_delta = None
         
     return ae_delta, head_delta, z_buffer, len(attack_flows), len(benign_flows)
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+    from pathlib import Path
+    
+    # Add project root to path
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+    sys.path.insert(0, str(PROJECT_ROOT))
+    
+    from scripts.benchmark_byzantine import run_experiment
+    
+    parser = argparse.ArgumentParser(description="Byzantine Deception Experiment")
+    parser.add_argument('--seeds', type=int, nargs='+', default=[0], help="Seeds to run")
+    parser.add_argument('--rounds', type=int, default=1, help="Rounds per seed")
+    args = parser.parse_args()
+    
+    print("=" * 80)
+    print("  Byzantine Deception Experiment (Camouflage Attack Validation)")
+    print("=" * 80)
+    
+    # Bypass the standard 10-round warmup so we can see the classification 
+    # immediately in round 1 for the experiment.
+    import config as cfg
+    cfg.CH2_WARMUP_ROUNDS = 0
+    
+    for seed in args.seeds:
+        print(f"\n>>> Running Seed {seed} <<<")
+        run_experiment(
+            strategy_name="FLTrust (Camouflage)",
+            num_clients=5,
+            byzantine_ratio=0.2, # 1 Byzantine client (Client 0)
+            rare_client=False,
+            mode="dc_fltrust",
+            num_rounds=args.rounds,
+            attack_mode="latent_inversion",
+            seed=seed
+        )
+

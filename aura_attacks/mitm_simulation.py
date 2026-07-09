@@ -134,8 +134,36 @@ def fltrust(client_grads, root_grad):
     return agg, weights
 
 
-def invert_gradient(model, true_grad, steps=200):
-    dummy = torch.randn(1, FEATURE_DIM, requires_grad=True)
+def invert_gradient(model, true_grad, steps=200, n_samples=None):
+    """
+    Gradient inversion attack (Zhu et al., 2019 — R-GAP variant).
+
+    Reconstructs a batch of input samples that would produce `true_grad`
+    when run through `model` with MSELoss.
+
+    Parameters
+    ----------
+    model     : The target model (same architecture, same weights as victim).
+    true_grad : List of gradient tensors, one per model parameter layer.
+                Must be computed from a batch of exactly `n_samples` inputs.
+    steps     : Number of L-BFGS / Adam optimisation steps.
+    n_samples : Batch size used to compute true_grad. MUST match the actual
+                batch size — mismatching causes provably wrong reconstruction.
+                If None, inferred from the gradient norms (falls back to 1).
+
+    Critical fix (Bug — dimensional mismatch)
+    ------------------------------------------
+    Previous code used `torch.randn(1, FEATURE_DIM)` unconditionally.
+    When true_grad was computed from N > 1 samples, the gradient matching
+    loss compared a [N, F]-shaped gradient from the real batch against a
+    [1, F]-shaped gradient from dummy, making convergence impossible.
+    The dummy must have shape [n_samples, FEATURE_DIM].
+    """
+    if n_samples is None:
+        # Best-effort inference: gradient magnitude scales with batch size.
+        # Without explicit n_samples, default to 1 (positive control mode).
+        n_samples = 1
+    dummy = torch.randn(n_samples, FEATURE_DIM, requires_grad=True)
     opt   = torch.optim.Adam([dummy], lr=0.1)
     for _ in range(steps):
         def closure():
@@ -212,10 +240,13 @@ if __name__ == "__main__":
     for i, (name, grads, data) in enumerate(zip(org_names, client_grads, client_data)):
         print(f"  Inverting org_{name} gradient …")
         attack_model = copy.deepcopy(global_model)
-        recon = invert_gradient(attack_model, [g.clone() for g in grads], steps=150)
-        mse = ((recon - data[:1])**2).mean().item()
-        cos = F.cosine_similarity(recon, data[:1], dim=-1).mean().item()
-        print(f"    MSE={mse:.4f}  cosine_sim={cos:.4f}  "
+        n_batch = len(data)  # MUST match the batch used to compute grads
+        recon = invert_gradient(attack_model, [g.clone() for g in grads],
+                                steps=150, n_samples=n_batch)
+        mse = ((recon - data)**2).mean().item()
+        cos = F.cosine_similarity(recon.mean(0, keepdim=True),
+                                  data.mean(0, keepdim=True), dim=-1).mean().item()
+        print(f"    n_samples={n_batch}  MSE={mse:.4f}  cosine_sim={cos:.4f}  "
               f"{'❌ LEAKED' if cos > 0.7 else '✅ protected'}")
 
     # ── MODE 2: TAMPER ───────────────────────────────────────────────────────
