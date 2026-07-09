@@ -1,3 +1,6 @@
+import sys
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
 """
 calibrate_thresholds.py — AURA Threshold Calibration & Feature Audit
 ======================================================================
@@ -219,7 +222,7 @@ def print_mse_report(mse_values: np.ndarray):
     print("=" * 70)
 
     if len(mse_values) == 0:
-        print("  ❌ No MSE samples collected. Check that dataset/NF-UNSW-NB15-v3.csv exists.")
+        print("  [X] No MSE samples collected. Check that dataset/NF-UNSW-NB15-v3.csv exists.")
         return
 
     percentiles = [50, 75, 90, 95, 99, 99.5, 99.9]
@@ -295,7 +298,7 @@ def audit_feature_index_map():
 
     benign_path = cfg.CSV_DIR / DATASET_CSV
     if not benign_path.exists():
-        print(f"\n  ❌ CSV not found: {benign_path}")
+        print(f"\n  [X] CSV not found: {benign_path}")
         print("     Cannot audit feature ordering without the source CSV.")
         print("=" * 70)
         return
@@ -318,7 +321,7 @@ def audit_feature_index_map():
     print(f"\n  Total feature columns in CSV : {len(feature_cols)}")
     print(f"  config.FEATURE_DIM           : {cfg.FEATURE_DIM}")
     if len(feature_cols) != cfg.FEATURE_DIM:
-        print(f"  ❌ MISMATCH! CSV has {len(feature_cols)} features but FEATURE_DIM={cfg.FEATURE_DIM}")
+        print(f"  [X] MISMATCH! CSV has {len(feature_cols)} features but FEATURE_DIM={cfg.FEATURE_DIM}")
     else:
         print(f"  ✓  Feature count matches FEATURE_DIM.")
     print()
@@ -392,7 +395,7 @@ def audit_feature_index_map():
                 status = "✓ PASS"
                 passed += 1
             else:
-                status = f"❌ MISMATCH (real={real_idx})"
+                status = f"[X] MISMATCH (real={real_idx})"
                 mismatched += 1
         else:
             real_idx = "?"
@@ -407,7 +410,7 @@ def audit_feature_index_map():
 
     if mismatched > 0 or missing > 0:
         print()
-        print("  ❌ ACTION REQUIRED: FEATURE_INDEX_MAP has incorrect indices.")
+        print("  [X] ACTION REQUIRED: FEATURE_INDEX_MAP has incorrect indices.")
         print("     The injection profiles are corrupting wrong features silently.")
         print("     Update FEATURE_INDEX_MAP in config.py with the 'real' column indices shown above.")
     else:
