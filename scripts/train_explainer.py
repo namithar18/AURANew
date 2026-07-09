@@ -327,6 +327,7 @@ def main():
             'min': class_features.min(axis=0).tolist(),
             'max': class_features.max(axis=0).tolist(),
             'mean': class_features.mean(axis=0).tolist(),
+            'std': class_features.std(axis=0).tolist(),
             'p05': np.percentile(class_features, 5, axis=0).tolist(),
             'p25': np.percentile(class_features, 25, axis=0).tolist(),
             'p75': np.percentile(class_features, 75, axis=0).tolist(),
