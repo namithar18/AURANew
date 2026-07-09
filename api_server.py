@@ -138,12 +138,76 @@ def api_fl_resolved():
 
 @app.route("/api/config", methods=["GET"])
 def api_config():
+    """Single source of truth for all frontend configuration.
+    Frontend must NEVER hardcode any value available here."""
+    # Attack types are derived from the corruption profiles in config
+    # so adding a new profile automatically surfaces it in the UI.
+    attack_types = [
+        {"type": k, "label": k.replace("_", " ").title()}
+        for k in cfg.ATTACK_CORRUPTION_PROFILES.keys()
+        if k != "custom"  # custom is always shown separately
+    ]
+    # Canonical 5 attack types the dashboard buttons use
+    dashboard_attacks = [
+        {"type": "ddos",     "label": "DDoS",      "icon": "🌊"},
+        {"type": "portscan", "label": "Port Scan",  "icon": "🔍"},
+        {"type": "lateral",  "label": "Lateral",    "icon": "↔"},
+        {"type": "exfil",    "label": "Exfil",      "icon": "📤"},
+        {"type": "web",      "label": "Web Atk",    "icon": "💉"},
+    ]
     return jsonify({
-        "theme": THEME,
-        "org_profiles": ORG_PROFILES,
-        "critical_allowlist": cfg.CRITICAL_ALLOWLIST,
-        "num_nodes": cfg.NUM_SYNTHETIC_NODES,
-        "refresh_ms": cfg.DASHBOARD_REFRESH_INTERVAL_MS,
+        "theme":                   THEME,
+        "org_profiles":            ORG_PROFILES,
+        "attack_types":            dashboard_attacks,
+        "all_attack_types":        attack_types,
+        "critical_allowlist":      cfg.CRITICAL_ALLOWLIST,
+        "num_nodes":               cfg.NUM_SYNTHETIC_NODES,
+        "refresh_ms":              cfg.DASHBOARD_REFRESH_INTERVAL_MS,
+        "mse_threshold_medium":    float(cfg.MSE_THRESHOLD_MEDIUM),
+        "mse_threshold_high":      float(cfg.MSE_THRESHOLD_HIGH),
+        "hitl_low_to_medium":      int(cfg.HITL_LOW_TO_MEDIUM_THRESHOLD),
+        "hitl_low_to_high":        int(cfg.HITL_LOW_TO_HIGH_THRESHOLD),
+        "hitl_medium_to_high":     int(cfg.HITL_MEDIUM_TO_HIGH_THRESHOLD),
+        "fl_num_rounds":           int(cfg.FL_NUM_ROUNDS),
+        "ema_alpha":               float(cfg.EMA_ALPHA),
+        "ema_sigma_multiplier":    float(cfg.EMA_SIGMA_MULTIPLIER),
+    })
+
+
+@app.route("/api/benchmark/results", methods=["GET"])
+def api_benchmark_results():
+    """Serve real benchmark result JSONs from reports/ directory.
+    Returns empty dicts (not errors) if a run hasn't been done yet."""
+    reports_dir = Path(cfg.BASE_DIR) / "reports"
+
+    def _safe_read(fname: str) -> dict:
+        p = reports_dir / fname
+        if p.exists():
+            try:
+                return json.loads(p.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logger.warning(f"[benchmark] Could not read {fname}: {exc}")
+        return {}
+
+    hitl   = _safe_read("hitl_benchmark_results.json")
+    ablation_raw = _safe_read("ablation_results.json")
+
+    # Normalise ablation — it may be a dict of mode→metrics
+    ablation = {}
+    if isinstance(ablation_raw, dict):
+        ablation = ablation_raw
+    elif isinstance(ablation_raw, list):
+        for row in ablation_raw:
+            key = row.get("Mode") or row.get("mode") or str(row)
+            ablation[key] = row
+
+    return jsonify({
+        "hitl":      hitl,
+        "ablation":  ablation,
+        "available": {
+            "hitl":     (reports_dir / "hitl_benchmark_results.json").exists(),
+            "ablation": (reports_dir / "ablation_results.json").exists(),
+        }
     })
 
 
