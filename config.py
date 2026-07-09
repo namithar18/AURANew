@@ -262,6 +262,7 @@ CONTRACT_ABI_FILE        = str(CONTRACTS_DIR / "ModelRegistry.abi")
 # If Ganache is not running, AURA falls back to local SHA-256 file logging
 BLOCKCHAIN_FALLBACK_LOG  = str(LOGS_DIR / "blockchain_fallback.jsonl")
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ISOLATION FOREST (Baseline Sanitisation)
 # ─────────────────────────────────────────────────────────────────────────────
