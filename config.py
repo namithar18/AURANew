@@ -73,10 +73,6 @@ WINDOW_SIZE = 60          # number of flow rows per graph snapshot
 # Time-To-Live: an edge is pruned after this many windows without traffic
 EDGE_TTL_WINDOWS = 3
 
-# Watts-Strogatz Random Topology Parameters (for inductive generalization)
-WS_K = 4           # Nearest neighbors
-WS_P = 0.15        # Rewiring probability
-
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTOENCODER (Layer 1 — Statistical Tripwire)
 # ─────────────────────────────────────────────────────────────────────────────

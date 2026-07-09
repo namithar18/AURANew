@@ -19,7 +19,6 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-import networkx as nx
 
 import config as cfg
 from aura.data_loader import CICIDSDataLoader, CSV_FILES
@@ -112,16 +111,6 @@ def train_autoencoder(
     return ae
 
 
-def generate_topology(n_nodes, k=cfg.WS_K, p=cfg.WS_P):
-    """
-    UPGRADE 4 - Watts-Strogatz Randomized Network Topology
-    Generates a small-world graph for inductive generalization testing.
-    """
-    G = nx.watts_strogatz_graph(n=n_nodes, k=k, p=p, seed=None)
-    edge_index = torch.tensor(list(G.edges()), dtype=torch.long).t().contiguous()
-    return G, edge_index
-
-
 def train_stgnn(
     gnn:     AuraSTGNN,
     graphs:  list,   # List of (graph_dict, labels) from stream_graphs()
@@ -149,37 +138,17 @@ def train_stgnn(
         gnn.train()
         epoch_loss = 0.0
 
-        # Extract number of nodes from the first graph to generate topology
-        if len(graphs) > 0:
-            n_nodes = graphs[0][0]["x"].shape[0]
-            G, ws_edge_index = generate_topology(n_nodes)
-            ws_edge_index = ws_edge_index.to(device)
-            
-            if epoch == 1 or epoch % 5 == 0:
-                avg_clustering = nx.average_clustering(G)
-                try:
-                    # Only compute on largest connected component to avoid errors
-                    largest_cc = max(nx.connected_components(G), key=len)
-                    subgraph = G.subgraph(largest_cc)
-                    avg_path_len = nx.average_shortest_path_length(subgraph)
-                except Exception:
-                    avg_path_len = float('inf')
-                print(f"  [Topology] Epoch {epoch}: Watts-Strogatz Rewired | Avg Clustering: {avg_clustering:.3f} | Avg Shortest Path (Largest CC): {avg_path_len:.3f}")
-
         for graph, edge_labels in graphs:
             x          = graph["x"].to(device)
-            # Original dataset topology (used for deriving ground-truth node labels)
-            orig_edge_index = graph["edge_index"].to(device)
-            # Override topology for STGNN forward pass with randomized Watts-Strogatz topology
-            edge_index = ws_edge_index
+            edge_index = graph["edge_index"].to(device)
 
-            # Approximate node labels: node is suspicious if any incident original edge is attack
+            # Approximate node labels: node is suspicious if any incident edge is attack
             N = x.shape[0]
             node_labels = torch.zeros(N, device=device)
             if edge_labels.sum() > 0:
                 attack_edges = edge_labels.bool()
-                src = orig_edge_index[0][attack_edges]
-                dst = orig_edge_index[1][attack_edges]
+                src = edge_index[0][attack_edges]
+                dst = edge_index[1][attack_edges]
                 node_labels[src] = 1.0
                 node_labels[dst] = 1.0
 
