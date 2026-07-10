@@ -55,7 +55,7 @@ LABEL_COL = "Label"
 BENIGN_LABEL = 0
 
 # Fraction of data to load per CSV (1.0 = all rows; reduce for speed during dev)
-DATA_LOAD_FRACTION = 0.3   # 30 % is enough to demo; use 1.0 for full training
+DATA_LOAD_FRACTION = 1   # 30 % is enough to demo; use 1.0 for full training
 
 # Fraction of windows held out for test set in canonical split
 TEST_SPLIT_FRACTION = 0.20
@@ -118,10 +118,10 @@ GNN_ATTACK_GRAPH_CAP = 100
 EMA_ALPHA = 0.05
 
 # An alert is raised when:  loss > EMA_mean + (EMA_SIGMA_MULTIPLIER × EMA_std)
-EMA_SIGMA_MULTIPLIER = 3.0
+EMA_SIGMA_MULTIPLIER = 0.5
 
 # Warm-up batches before thresholds are active (avoids cold-start false alarms)
-EMA_WARMUP_BATCHES = 50
+EMA_WARMUP_BATCHES = 3
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SEVERITY ENGINE — Temporal Accumulator + EMA Trajectory
@@ -132,9 +132,9 @@ EMA_WARMUP_BATCHES = 50
 TEMPORAL_WINDOW_SECONDS = 300   # 5 minutes — configurable
 
 # EMA trajectory persistence threshold.
-# K consecutive readings above 2.0σ → MEDIUM floor.
-# K consecutive readings above 2.5σ → HIGH floor.
-K_CONSECUTIVE_READINGS  = 5     # configurable
+# K consecutive readings above 1.0σ → triggers GNN check.
+# Set to 1 so every window that clears the sigma band is evaluated (no streak required).
+K_CONSECUTIVE_READINGS  = 1     # configurable
 
 
 # ─────────────────────────────────────────────────────────────────────────────

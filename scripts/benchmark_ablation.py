@@ -286,12 +286,16 @@ class NodeEMATracker:
             std = max(var ** 0.5, 1e-8)
             fired = residual > (mean + self.sigma_mult * std)
 
-        # Update EMA mean/variance (always — even during warm-up)
-        delta = residual - mean
-        new_mean = mean + self.alpha * delta
-        new_var = (1 - self.alpha) * (var + self.alpha * delta * delta)
-        self._mean[node_id] = new_mean
-        self._var[node_id] = new_var
+        # Update EMA mean/variance ONLY if the reading is benign (Robust EMA).
+        # If we update on anomalous readings, the baseline chases the attack
+        # and suppresses subsequent alerts for persistent threats.
+        if not fired:
+            delta = residual - mean
+            new_mean = mean + self.alpha * delta
+            new_var = (1 - self.alpha) * (var + self.alpha * delta * delta)
+            self._mean[node_id] = new_mean
+            self._var[node_id] = new_var
+        
         self._seen[node_id] = seen + 1
 
         streak = self._streak.get(node_id, 0)
@@ -622,7 +626,7 @@ def main():
     parser.add_argument("--bundle", type=str, default=str(cfg.MODELS_DIR / "aura_bundle.pth"))
     parser.add_argument("--load-fraction", type=float, default=cfg.DATA_LOAD_FRACTION)
     parser.add_argument("--test-fraction", type=float, default=cfg.TEST_SPLIT_FRACTION)
-    parser.add_argument("--ae-percentile", type=float, default=95.0)
+    parser.add_argument("--ae-percentile", type=float, default=80.0)
     parser.add_argument("--gnn-threshold", type=float, default=0.5)
     args = parser.parse_args()
 
@@ -633,16 +637,42 @@ def main():
     bundle_path = Path(args.bundle)
     bundle = AURAModelBundle()
 
-    if bundle_path.exists():
-        logger.info(f"Loading pre-trained bundle from {bundle_path} …")
-        state = torch.load(bundle_path, map_location=device, weights_only=True)
-        bundle.load_state_dict(state)
-        logger.info("✓ Model bundle loaded successfully.")
-    else:
-        logger.warning(
-            f"Bundle not found at {bundle_path}. Running with randomly initialised "
-            "weights — results will not be meaningful. Train first with: python train.py"
+    if not bundle_path.exists():
+        raise FileNotFoundError(
+            f"[FATAL] Bundle not found at {bundle_path}.\n"
+            "Run `python train.py` first to produce a trained checkpoint, then re-run."
         )
+
+    logger.info(f"Loading pre-trained bundle from {bundle_path} …")
+    checkpoint = torch.load(bundle_path, map_location=device, weights_only=True)
+
+    # This script only requires the Autoencoder and STGNN sub-modules.
+    # AttackHead is part of AURAModelBundle for FL training but is NOT needed
+    # here — do not silently fill it with random weights.
+    # Extract only the keys that belong to each sub-module and load strictly.
+    def _extract_submodule(full_state: dict, prefix: str) -> dict:
+        """Strip 'prefix.' from keys and return the sub-dict."""
+        stripped = {
+            k[len(prefix) + 1:]: v
+            for k, v in full_state.items()
+            if k.startswith(prefix + ".")
+        }
+        if not stripped:
+            raise RuntimeError(
+                f"[FATAL] Checkpoint at {bundle_path} contains NO keys for '{prefix}'.\n"
+                f"Available top-level prefixes: "
+                f"{sorted({k.split('.')[0] for k in full_state})}\n"
+                "The checkpoint may be corrupt or from an incompatible architecture."
+            )
+        return stripped
+
+    ae_state   = _extract_submodule(checkpoint, "autoencoder")
+    stgnn_state = _extract_submodule(checkpoint, "stgnn")
+
+    bundle.autoencoder.load_state_dict(ae_state,   strict=True)
+    bundle.stgnn.load_state_dict(stgnn_state, strict=True)
+    logger.info(f"[OK] AE weights loaded ({len(ae_state)} tensors).")
+    logger.info(f"[OK] STGNN weights loaded ({len(stgnn_state)} tensors).")
 
     ae = bundle.autoencoder.to(device).eval()
     stgnn = bundle.stgnn.to(device).eval()
@@ -735,9 +765,9 @@ def main():
         "  AUC_Approximate=True): gated-out nodes never receive a GraphSAGE score,\n"
         "  so no single continuous decision function exists across all nodes.\n"
     )
-    print(f"  ✓ Exported to:")
-    print(f"    • {reports_dir / 'ablation_results.csv'}")
-    print(f"    • {reports_dir / 'ablation_results.json'}")
+    print(f"  [OK] Exported to:")
+    print(f"    - {reports_dir / 'ablation_results.csv'}")
+    print(f"    - {reports_dir / 'ablation_results.json'}")
     print(f"{'=' * 72}\n")
 
 
