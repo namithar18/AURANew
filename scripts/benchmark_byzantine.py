@@ -364,16 +364,17 @@ def run_experiment(
     import os
     global_model  = AURAModelBundle()
     
-    # Load pretrained AE weights
-    ae_path = os.path.join('saved_models', 'autoencoder_best.pth')
-    if not os.path.exists(ae_path):
+    # Load full pretrained bundle (so STGNN is also preserved, not random!)
+    bundle_path = cfg.MODELS_DIR / 'aura_bundle.pth'
+    if not bundle_path.exists():
         raise FileNotFoundError(
-            f"Pretrained AE not found at {ae_path}. "
+            f"Pretrained bundle not found at {bundle_path}. "
             "Run train.py before benchmark_byzantine.py."
         )
-    global_model.autoencoder.load_state_dict(torch.load(ae_path, map_location='cpu'))
+    state = torch.load(bundle_path, map_location='cpu', weights_only=True)
+    global_model.load_state_dict(state, strict=False)
     global_model.autoencoder.eval()
-    logger.info(f"[INIT] Loaded pretrained AE from {ae_path}")
+    logger.info(f"[INIT] Loaded pretrained bundle from {bundle_path}")
 
     global_arrays = [p.detach().cpu().numpy() for p in global_model.parameters()]
 
@@ -655,6 +656,11 @@ def run_experiment(
         h.update(np.ascontiguousarray(arr, dtype=np.float32).tobytes())
     model_hash = "0x" + h.hexdigest()
     print(f"\n  [{strategy_name} | {byzantine_ratio*100:.0f}% Byzantine] Final Model SHA-256: {model_hash}")
+    
+    # Save the post-FL model to disk so we can ablate it
+    post_fl_path = cfg.MODELS_DIR / f"aura_bundle_post_fl_{mode}.pth"
+    torch.save(global_model.state_dict(), post_fl_path)
+    print(f"  [FLTrust] Saved post-FL model to {post_fl_path.name}")
     logger.info(f"Finished {strategy_name} | {byzantine_ratio*100:.0f}% Byzantine simulation.")
 
 
