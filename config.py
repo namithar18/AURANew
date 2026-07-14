@@ -780,3 +780,4 @@ def preflight_dc_fltrust_check():
     print(f"  Attack classes present: {list(profiles.keys())}")
     print(f"  This timestamp should match your most recent train_explainer.py run.")
     return True
+CH2_WARMUP_ROUNDS = 10

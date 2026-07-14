@@ -856,15 +856,122 @@ class KrumFedAURA(FedAvg):
             logger.info(f"{round_tag} Received update  |  "
                         f"num_examples={fit_res.num_examples}  loss={client_loss}")
 
-        # ── FLTrust Aggregation ──────────────────────────────────────────────────────────────
-        print(f"\n{round_tag} Running FLTrust aggregation on {n_received} updates …")
-        aggregated, trust_scores, flagged_indices = fltrust_aggregate(
-            global_model   = self._global_model,
-            client_updates = client_updates,
-            root_data      = self._root_data,
-            server_lr      = cfg.FLTRUST_SERVER_LR,
-            min_trust      = cfg.FLTRUST_MIN_TRUST_SCORE,
+        # ── DC-FLTrust Aggregation ───────────────────────────────────────────
+        print(f"\n{round_tag} Running DC-FLTrust aggregation on {n_received} updates …")
+
+        # Compute how many AE params the global model has
+        n_ae_params = len(list(self._global_model.autoencoder.parameters()))
+
+        # Split each client's 16-tensor payload into AE (first 12) and Head (last 4)
+        global_ae_arrays = [p.detach().cpu().numpy()
+                            for p in self._global_model.autoencoder.parameters()]
+        global_head_arrays = [p.detach().cpu().numpy()
+                              for p in self._global_model.attack_head.parameters()]
+
+        client_ae_deltas   = []
+        client_head_deltas = []
+        for arrays in client_updates:
+            ae_arrays   = arrays[:n_ae_params]
+            head_arrays = arrays[n_ae_params:]
+            # Compute deltas vs current global
+            ae_delta = {
+                f"layer_{i}": torch.tensor(c - g, dtype=torch.float32)
+                for i, (c, g) in enumerate(zip(ae_arrays, global_ae_arrays))
+            }
+            head_delta = {
+                f"layer_{i}": torch.tensor(c - g, dtype=torch.float32)
+                for i, (c, g) in enumerate(zip(head_arrays, global_head_arrays))
+            }
+            client_ae_deltas.append(ae_delta)
+            client_head_deltas.append(head_delta)
+
+        # Compute server reference deltas (full-batch on root data)
+        server_model = AURAModelBundle()
+        with torch.no_grad():
+            for p, gp in zip(server_model.autoencoder.parameters(),
+                             self._global_model.autoencoder.parameters()):
+                p.copy_(gp)
+            for p, gp in zip(server_model.attack_head.parameters(),
+                             self._global_model.attack_head.parameters()):
+                p.copy_(gp)
+
+        ae_opt = torch.optim.Adam(server_model.autoencoder.parameters(),
+                                  lr=cfg.FLTRUST_SERVER_LR)
+        server_model.autoencoder.train()
+        ae_opt.zero_grad()
+        # Full-batch gradient — eliminates sampling noise at convergence
+        x_hat, _ = server_model.autoencoder(self._root_data)
+        loss = nn.functional.mse_loss(x_hat, self._root_data)
+        loss.backward()
+        ae_opt.step()
+        server_model.eval()
+
+        root_ae_delta = {
+            f"layer_{i}": (p.detach().cpu() - gp.detach().cpu()).float()
+            for i, (p, gp) in enumerate(zip(server_model.autoencoder.parameters(),
+                                            self._global_model.autoencoder.parameters()))
+        }
+        
+        # Compute root head delta: run root data through AE encoder to get z vectors,
+        # then one gradient step on AttackHead
+        server_model.autoencoder.eval()
+        with torch.no_grad():
+            _, z_root = server_model.autoencoder(self._root_data)
+        
+        head_opt = torch.optim.Adam(server_model.attack_head.parameters(),
+                                    lr=cfg.FLTRUST_SERVER_LR)
+        server_model.attack_head.train()
+        head_opt.zero_grad()
+        preds = server_model.attack_head(z_root).squeeze()
+        # Pseudo-label 0.0 — root data is benign, so attack probability should be low
+        pseudo_labels = torch.zeros_like(preds)
+        head_loss = nn.functional.binary_cross_entropy(preds, pseudo_labels)
+        head_loss.backward()
+        head_opt.step()
+        server_model.attack_head.eval()
+        
+        root_head_delta = {
+            f"layer_{i}": (p.detach().cpu() - gp.detach().cpu()).float()
+            for i, (p, gp) in enumerate(zip(server_model.attack_head.parameters(),
+                                            self._global_model.attack_head.parameters()))
+        }
+
+        client_round_counts = [server_round] * n_received
+
+        agg_ae_delta, agg_head_delta, ch1_scores, ch2_scores, classifications = dc_fltrust_aggregate(
+            client_ae_deltas   = client_ae_deltas,
+            client_head_deltas = client_head_deltas,
+            root_ae_delta      = root_ae_delta,
+            root_head_delta    = root_head_delta,
+            client_round_counts = client_round_counts,
+            ch2_warmup_rounds  = cfg.CH2_WARMUP_ROUNDS,
+            current_round      = server_round,
         )
+
+        # Apply deltas to global model to produce aggregated weight arrays
+        aggregated_ae = [
+            (gp.detach().cpu() + agg_ae_delta[f"layer_{i}"]).numpy().astype(np.float32)
+            for i, gp in enumerate(self._global_model.autoencoder.parameters())
+        ]
+        if agg_head_delta is not None:
+            aggregated_head = [
+                (gp.detach().cpu() + agg_head_delta[f"layer_{i}"]).numpy().astype(np.float32)
+                for i, gp in enumerate(self._global_model.attack_head.parameters())
+            ]
+        else:
+            # No head update this round — keep current global head weights
+            aggregated_head = global_head_arrays
+
+        # Recombine into a single flat list matching model_to_ndarrays layout
+        aggregated = aggregated_ae + aggregated_head
+
+        # Map DC-FLTrust classifications to flagged_indices for downstream logging
+        flagged_indices = [
+            i for i, c in enumerate(classifications)
+            if c in ('BYZANTINE', 'BYZANTINE_FAKE_ATTACK')
+        ]
+        trust_scores = ch1_scores  # use ch1 as the primary trust score for logs
+
         self._model_version += 1
         model_version_tag = f"v{self._model_version}.{server_round}"
 

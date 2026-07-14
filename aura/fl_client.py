@@ -93,17 +93,25 @@ def hash_model_weights(arrays: List[np.ndarray]) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def model_to_ndarrays(model: nn.Module) -> List[np.ndarray]:
-    """Serialize AE parameters only for Flower federation.
-    AttackHead deltas are transmitted separately via DC-FLTrust channel 2.
-    GraphSAGE is strictly local — never serialized.
+    """Serialize AE + AttackHead parameters as a single flat list.
+    Layout: first 12 tensors = AE, next 4 tensors = AttackHead.
+    Server unpacks by position. GraphSAGE is strictly local — never serialized.
     """
-    return [p.detach().cpu().numpy()
-            for p in model.autoencoder.parameters()]
+    ae_arrays   = [p.detach().cpu().numpy() for p in model.autoencoder.parameters()]
+    head_arrays = [p.detach().cpu().numpy() for p in model.attack_head.parameters()]
+    return ae_arrays + head_arrays
 
 def ndarrays_to_model(model: nn.Module, arrays: List[np.ndarray]) -> None:
-    """Load AE parameters only from Flower payload."""
+    """Load AE + AttackHead parameters from unified Flower payload.
+    Layout: first 12 = AE, next 4 = AttackHead. Matches model_to_ndarrays.
+    """
+    n_ae = len(list(model.autoencoder.parameters()))
+    ae_arrays   = arrays[:n_ae]
+    head_arrays = arrays[n_ae:]
     with torch.no_grad():
-        for p, arr in zip(model.autoencoder.parameters(), arrays):
+        for p, arr in zip(model.autoencoder.parameters(), ae_arrays):
+            p.copy_(torch.tensor(arr))
+        for p, arr in zip(model.attack_head.parameters(), head_arrays):
             p.copy_(torch.tensor(arr))
 
 
@@ -473,10 +481,13 @@ class AURAFlowerClient(fl.client.Client):
             loader = torch.utils.data.DataLoader(
                 torch.utils.data.TensorDataset(self.train_data), batch_size=256
             )
-            ae, ae_optimizer, loader = privacy_engine.make_private(
+            dp_result = privacy_engine.make_private(
                 module=ae, optimizer=ae_optimizer, data_loader=loader,
                 noise_multiplier=cfg.DP_NOISE_MULTIPLIER, max_grad_norm=cfg.DP_MAX_GRAD_NORM
             )
+            ae = dp_result[0]
+            ae_optimizer = dp_result[1]
+            dp_loader = dp_result[2]
             
         mse_split = getattr(cfg, 'CH2_MSE_SPLIT_THRESHOLD', cfg.MSE_THRESHOLD_HIGH)
         
