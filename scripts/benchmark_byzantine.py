@@ -72,9 +72,14 @@ try:
     all_windows = list(_loader.stream_graphs(_shared_scaler))
 
     # Get canonical train/test split
-    _, train_windows, test_windows = get_canonical_split(
+    calib_windows, train_windows, test_windows = get_canonical_split(
         all_windows, test_fraction=0.20
     )
+    
+    # CRITICAL: calibration_windows are a prefix of train_windows.
+    # To guarantee zero data leakage between the server's root dataset
+    # (built from calib_windows) and client training data, we must remove them.
+    train_windows = train_windows[len(calib_windows):]
 
     # Extract ALL flows from train windows, randomised once for reproducibility
     _all_train_flows = torch.cat([
@@ -134,6 +139,7 @@ def generate_client_data(
         f"[generate_client_data] Client {client_idx}: "
         f"train={len(train_data)} flows, val={len(val_data)} flows"
     )
+    print(f"[CLIENT DATA] Client {client_idx} using shared scaler instance: {id(_shared_scaler)}")
 
     if is_rare:
         # Legitimate but distribution-shifted client (e.g. hospital with rare traffic).
@@ -185,95 +191,27 @@ def _run_local_training_dual(
     mse_threshold_high: float,
     head_epochs: int = 3
 ) -> tuple:
-    """
-    Two-pass dual-channel local training.
+    from aura.local_training import run_two_pass_local_training
     
-    Pass 1: AE trains on benign-only flows (MSE below threshold).
-             AE latent geometry stays clean — attack flows never 
-             influence encoder weights.
-    Pass 2: Inference-only z collection from high-MSE flows.
-             AE in eval mode, no gradient computation, weights unchanged.
-             AttackHead trains on collected z vectors with soft MSE weighting.
+    z_buffer, n_benign, n_high_mse, _ = run_two_pass_local_training(
+        ae, attack_head, all_flows,
+        ae_optimizer, head_optimizer,
+        mse_threshold=mse_threshold_high,
+        head_epochs=head_epochs
+    )
     
-    Returns: (ae_delta, head_delta, z_buffer, n_benign, n_high_mse)
-    z_buffer is returned for potential submission to dynamic reference buffer.
-    """
+    assert n_benign > 0 or n_high_mse > 0, "FATAL: No flows processed in two-pass training"
+    logger.info(f"Two-pass: benign={n_benign}, high_mse={n_high_mse}, z_buffer={sum(len(z) for z in z_buffer)}")
     
-    # === PRE-PASS: classify flows without updating weights ===
-    ae.eval()
-    with torch.no_grad():
-        recon, _ = ae(all_flows)
-        mse_per_flow = F.mse_loss(recon, all_flows, reduction='none').mean(dim=1)
-    ae.train()
-    
-    benign_mask = mse_per_flow < mse_threshold_high
-    high_mse_mask = ~benign_mask
-    benign_flows = all_flows[benign_mask]
-    high_mse_flows = all_flows[high_mse_mask]
-    high_mse_values = mse_per_flow[high_mse_mask]
-    
-    # === PASS 1: AE trains on benign flows only ===
-    ae_loss_val = 0.0
-    if len(benign_flows) > 0:
-        ae_optimizer.zero_grad()
-        recon_benign, _ = ae(benign_flows)
-        ae_loss = F.mse_loss(recon_benign, benign_flows)
-        ae_loss.backward()
-        ae_optimizer.step()
-        ae_loss_val = ae_loss.item()
-    
-    # === PASS 2: Inference-only z collection ===
-    # ae.eval() ensures BatchNorm/Dropout behave consistently
-    # torch.no_grad() ensures no gradient tape — weights CANNOT change
-    z_buffer = []
-    ae.eval()
-    with torch.no_grad():
-        if len(high_mse_flows) > 0:
-            for i in range(0, len(high_mse_flows), 256):
-                batch = high_mse_flows[i:i+256]
-                z = ae.encode(batch)
-                z_buffer.append(z.detach().cpu())
-    ae.train()
-    
-    # === AttackHead training with soft MSE weighting ===
-    head_loss_val = 0.0
-    if z_buffer:
-        z_tensor = torch.cat(z_buffer)
-        
-        # Soft weight: flows with higher MSE contribute more strongly
-        # Prevents hard binary threshold from introducing arbitrary supervision boundary
-        mse_weights = high_mse_values.cpu()
-        mse_weights = (mse_weights - mse_weights.min()) / \
-                      (mse_weights.max() - mse_weights.min() + 1e-8)
-        # Match weight count to z_buffer count (may differ if batching truncates)
-        mse_weights = mse_weights[:len(z_tensor)]
-        
-        for _ in range(head_epochs):
-            head_optimizer.zero_grad()
-            preds = attack_head(z_tensor).squeeze()
-            pseudo_labels = torch.ones(len(z_tensor), device=z_tensor.device)
-            head_loss = F.binary_cross_entropy(preds, pseudo_labels,
-                                               weight=mse_weights)
-            head_loss.backward()
-            head_optimizer.step()
-            head_loss_val = head_loss.item()
-    
-    # === Compute weight deltas for server transmission ===
     ae_delta = {k: ae.state_dict()[k].clone() - global_ae_weights[k]
                 for k in ae.state_dict()}
-    if len(high_mse_flows) > 0:
+    if n_high_mse > 0:
         head_delta = {k: attack_head.state_dict()[k].clone() - global_head_weights[k]
                       for k in attack_head.state_dict()}
     else:
         head_delta = None
         
-    logger.debug(
-        f"Client round local: "
-        f"benign_flows={len(benign_flows)}, high_mse_flows={len(high_mse_flows)}, "
-        f"z_buffer_size={len(z_buffer) * 256 if z_buffer else 0}"
-    )
-    
-    return ae_delta, head_delta, z_buffer, len(benign_flows), len(high_mse_flows)
+    return ae_delta, head_delta, z_buffer, n_benign, n_high_mse
 
 
 
@@ -379,10 +317,7 @@ def run_experiment(
     global_arrays = [p.detach().cpu().numpy() for p in global_model.parameters()]
 
     # FLTrust server root dataset (benign reference -- built once per experiment)
-    if _shared_scaler is not None:
-        root_data = _build_benchmark_root_dataset()
-    else:
-        root_data = _build_root_dataset(2000, scaler=None)  # standalone fallback only
+    root_data = _build_root_dataset(_shared_scaler, n_samples=2000)
 
     # Federated rounds
     from aura.attack_reference import AttackReferenceBuffer
@@ -513,11 +448,18 @@ def run_experiment(
 
             from aura.fl_server import ae_only_fltrust_aggregate, joint_dual_fltrust_aggregate, dc_fltrust_aggregate
             
-            # Server root training for channel 2 reference deltas
             root_ae = FlowAutoencoder()
             root_head = AttackHead()
+            import os
+            assert os.path.exists('saved_models/autoencoder_best.pth'), \
+                "Pretrained AE must exist before computing root gradient"
+            
+            # CRITICAL: Must use EXACTLY the same weights the clients start from this round.
+            # global_model has the latest federated weights (which in round 1 is the pretrained bundle).
             root_ae.load_state_dict(global_model.autoencoder.state_dict())
             root_head.load_state_dict(global_model.attack_head.state_dict())
+            
+            print(f"[ROOT] Loaded pretrained AE for root gradient computation")
             root_ae_opt = torch.optim.Adam(root_ae.parameters(), lr=1e-3)
             root_head_opt = torch.optim.Adam(root_head.parameters(), lr=1e-3)
             

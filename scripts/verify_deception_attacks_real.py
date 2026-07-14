@@ -17,82 +17,87 @@ from scripts.benchmark_byzantine import _run_local_training_dual
 from scripts.experiments.byzantine_deception_experiment import _run_latent_inversion_byzantine
 from aura.fl_server import ae_only_fltrust_aggregate, joint_dual_fltrust_aggregate, dc_fltrust_aggregate
 
-def measure_head_auroc(global_ae, test_benign, test_attack):
+def measure_head_auroc(global_ae, global_head, test_flows, test_labels):
+    """
+    Measure how well the global AttackHead distinguishes attack from
+    benign flows after benchmark rounds.
+
+    Uses the AttackHead, not AE reconstruction error.
+    Flows are encoded through AE first to get z vectors,
+    then scored by AttackHead.
+
+    Args:
+        global_ae: the global AE after benchmark rounds
+        global_head: the global AttackHead after benchmark rounds
+        test_flows: flows from canonical TEST split only
+        test_labels: 0=benign, 1=attack
+    """
     from sklearn.metrics import roc_auc_score
-    # Measure the AE's discriminative ability using MSE reconstruction error
+    import numpy as np
+    import logging
+
+    logger = logging.getLogger(__name__)
+
     global_ae.eval()
-    with torch.no_grad():
-        recon_b, _ = global_ae(test_benign)
-        recon_a, _ = global_ae(test_attack)
-        scores_b = F.mse_loss(recon_b, test_benign, reduction='none').mean(dim=1).cpu().numpy()
-        scores_a = F.mse_loss(recon_a, test_attack, reduction='none').mean(dim=1).cpu().numpy()
-    
-    labels = np.concatenate([
-        np.zeros(len(scores_b)),
-        np.ones(len(scores_a))
-    ])
-    scores = np.concatenate([scores_b, scores_a])
-    return roc_auc_score(labels, scores)
+    global_head.eval()
 
-def get_canonical_split(windows, test_fraction=0.20):
-    split_idx = int(len(windows) * (1 - test_fraction))
-    train_windows = windows[:split_idx]
-    test_windows = windows[split_idx:]
-    return None, train_windows, test_windows
-
-def build_auroc_test_set(ae, data_loader, scaler, n_benign=500, n_attack=500):
-    
-    x_benign = []
-    x_attack = []
-    
-    ae.eval()
     with torch.no_grad():
-        _, train_windows, test_windows = get_canonical_split(
-            list(data_loader.stream_graphs(scaler)),
-            test_fraction=0.20
+        _, z = global_ae(test_flows)
+        scores = global_head(z).squeeze().cpu().numpy()
+
+    labels = test_labels.cpu().numpy()
+
+    # Sanity check: both classes must be present
+    assert len(np.unique(labels)) == 2, \
+        "FATAL: test set must contain both benign and attack flows"
+
+    auroc = roc_auc_score(labels, scores)
+
+    # If AUROC < 0.5, the head has inverted output — report but do not correct
+    if auroc < 0.5:
+        logger.warning(
+            f"AttackHead AUROC={auroc:.4f} < 0.5 — head may output "
+            f"inverted scores (high for benign, low for attack). "
+            f"Do NOT apply 1-auroc correction without investigating cause."
         )
-        
-        for graph, labels in train_windows + test_windows:
-            flows = graph['edge_attr']
-            flow_labels = labels
-            
-            # flow_labels might be shape (N, 1) or (N,). Ensure proper boolean mask
-            benign_mask = (flow_labels == 0).flatten()
-            attack_mask = (flow_labels == 1).flatten()
-            
-            if benign_mask.any() and sum(len(x) for x in x_benign) < n_benign:
-                x_benign.append(flows[benign_mask].detach().cpu())
-            if attack_mask.any() and sum(len(x) for x in x_attack) < n_attack:
-                x_attack.append(flows[attack_mask].detach().cpu())
-            
-            if (sum(len(x) for x in x_benign) >= n_benign and
-                sum(len(x) for x in x_attack) >= n_attack):
-                break
-    ae.train()
-    
-    x_benign = torch.cat(x_benign)[:n_benign]
-    x_attack = torch.cat(x_attack)[:n_attack]
-    
-    print(f"[AUROC test set] benign={len(x_benign)}, attack={len(x_attack)}")
-    assert len(x_benign) > 0, "No benign flows found in test set"
-    assert len(x_attack) > 0, "No attack flows found in test set"
-    
-    # We also need train data flows to give to the clients during the benchmark!
-    # Let's extract a small pool of train flows from the train_windows
-    train_benign = []
-    train_attack = []
-    for graph, labels in train_windows + test_windows:
+    return auroc
+
+def build_auroc_test_set(ae, test_windows, n_benign=500, n_attack=200):
+    """
+    Build AUROC evaluation set from canonical TEST windows only.
+    Never uses train windows — no contamination.
+    """
+    benign_flows = []
+    attack_flows = []
+
+    for graph, labels in test_windows:
         flows = graph['edge_attr']
-        flow_labels = labels
-        benign_mask = (flow_labels == 0).flatten()
-        attack_mask = (flow_labels == 1).flatten()
-        if benign_mask.any(): train_benign.append(flows[benign_mask])
-        if attack_mask.any(): train_attack.append(flows[attack_mask])
-        if len(train_benign) > 50 and len(train_attack) > 50: break
-    
-    train_benign = torch.cat(train_benign)
-    train_attack = torch.cat(train_attack)
-    return x_benign, x_attack, train_benign, train_attack
+        benign_mask = labels == 0
+        attack_mask = labels == 1
+
+        if benign_mask.any() and sum(len(f) for f in benign_flows) < n_benign:
+            benign_flows.append(flows[benign_mask])
+        if attack_mask.any() and sum(len(f) for f in attack_flows) < n_attack:
+            attack_flows.append(flows[attack_mask])
+
+        if (sum(len(f) for f in benign_flows) >= n_benign and
+            sum(len(f) for f in attack_flows) >= n_attack):
+            break
+
+    assert benign_flows, "FATAL: No benign flows in test windows"
+    assert attack_flows, "FATAL: No attack flows in test windows — check dataset"
+
+    x_benign = torch.cat(benign_flows)[:n_benign]
+    x_attack = torch.cat(attack_flows)[:n_attack]
+    x_all = torch.cat([x_benign, x_attack])
+    y_all = torch.cat([
+        torch.zeros(len(x_benign)),
+        torch.ones(len(x_attack))
+    ])
+
+    print(f"[AUROC test set] benign={len(x_benign)}, attack={len(x_attack)}, "
+          f"source=canonical test windows only")
+    return x_all, y_all
 
 def run_benchmark(train_benign, train_attack, mode, attack_mode, rounds, seed):
     torch.manual_seed(seed)
@@ -253,12 +258,12 @@ def run_benchmark(train_benign, train_attack, mode, attack_mode, rounds, seed):
         'head_weight': head_weight
     }
 
-def run_single_seed_sequential(seed, modes, attack_mode, rounds, x_benign, x_attack, train_benign, train_attack):
+def run_single_seed_sequential(seed, modes, attack_mode, rounds, test_flows, test_labels, train_benign, train_attack):
     results = {}
     for mode in modes:
         print(f"[Seed {seed}] Running mode={mode}, attack={attack_mode}...")
         result = run_benchmark(train_benign, train_attack, mode, attack_mode, rounds, seed)
-        result['auroc'] = measure_head_auroc(result['global_ae'], x_benign, x_attack)
+        result['auroc'] = measure_head_auroc(result['global_ae'], result['global_head'], test_flows, test_labels)
         results[mode] = result
         
         gc.collect()
@@ -283,7 +288,23 @@ def main():
     if os.path.exists(ae_path):
         global_ae.load_state_dict(torch.load(ae_path, map_location='cpu'))
     
-    x_benign, x_attack, train_benign, train_attack = build_auroc_test_set(global_ae, loader, scaler)
+    from aura.split_manager import get_canonical_split
+    _, train_windows, test_windows = get_canonical_split(list(loader.stream_graphs(scaler)), test_fraction=0.20)
+    
+    test_flows, test_labels = build_auroc_test_set(global_ae, test_windows, n_benign=500, n_attack=200)
+    
+    train_benign = []
+    train_attack = []
+    for graph, labels in train_windows:
+        flows = graph['edge_attr']
+        flow_labels = labels
+        benign_mask = (flow_labels == 0).flatten()
+        attack_mask = (flow_labels == 1).flatten()
+        if benign_mask.any(): train_benign.append(flows[benign_mask])
+        if attack_mask.any(): train_attack.append(flows[attack_mask])
+        if len(train_benign) > 50 and len(train_attack) > 50: break
+    train_benign = torch.cat(train_benign)
+    train_attack = torch.cat(train_attack)
     
     # Task 2: Check MSE for train_benign and train_attack
     global_ae.eval()
@@ -305,7 +326,7 @@ def main():
                 modes=['ae_only', 'joint_dual', 'dc_fltrust'],
                 attack_mode=attack,
                 rounds=5,
-                x_benign=x_benign, x_attack=x_attack,
+                test_flows=test_flows, test_labels=test_labels,
                 train_benign=train_benign, train_attack=train_attack
             )
             for mode in ['ae_only', 'joint_dual', 'dc_fltrust']:

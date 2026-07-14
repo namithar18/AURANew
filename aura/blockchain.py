@@ -1,5 +1,11 @@
 """
+DEPRECATED: blockchain.py is superseded by aura/merkle_tree.py.
+This file is retained for reference only. Do not use in new code.
+The Ganache/Web3 dependency has been replaced with a pure-Python
+append-only Merkle tree that requires no external blockchain node.
+
 aura/blockchain.py — Immutable Audit Log via Web3 / Ganache
+"""
 ============================================================
 
 Architecture Role

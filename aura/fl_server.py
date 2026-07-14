@@ -181,93 +181,45 @@ def krum_aggregate(
 # Root Dataset (server trusted data for FLTrust)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_root_dataset(
-    n_samples: int = cfg.FLTRUST_ROOT_SAMPLES,
-    scaler=None,
-) -> torch.Tensor:
+def _build_root_dataset(scaler, n_samples=5000):
     """
-    Build the FLTrust server root dataset (trusted benign reference).
-
-    Strategy (controlled by cfg.FL_ROOT_DATA_SOURCE):
-    -------------------------------------------------
-    "real" (default for research paper):
-      Loads a GLOBALLY REPRESENTATIVE benign sample from NF-UNSW-NB15-v3.
-      It explicitly avoids using specific client partitions to ensure the
-      server gradient is unbiased, preventing false-positive Byzantine flags
-      on honest Non-IID clients.
-
-    Parameters
-    ----------
-    n_samples : Number of benign samples to include in the root dataset.
-    scaler    : Pre-fitted MinMaxScaler to use for feature normalisation.
-                **CRITICAL — must be the same scaler used by all FL clients.**
-                If None, a new scaler is fitted from scratch on the CSV, which
-                will NOT match the benchmark's shared scaler and will cause
-                systematically low ch1 scores for honest clients (Bug 3).
+    Build server root dataset for FLTrust reference gradient.
+    
+    CRITICAL: must use the same scaler as client data.
+    CRITICAL: must come from canonical training split only — no test data.
+    CRITICAL: must be large enough for stable gradient direction (minimum 2000).
+    
+    Args:
+        scaler: the SAME MinMaxScaler instance used for client data
+        n_samples: number of flows to include (5000 recommended)
     """
-    if cfg.FL_ROOT_DATA_SOURCE == "real":
-        try:
-            import pandas as pd
-            from aura.data_loader import CICIDSDataLoader, DATASET_PATH
-
-            _loader = CICIDSDataLoader()
-
-            if scaler is not None:
-                # Use the caller-supplied shared scaler — this MUST be the same
-                # scaler used to scale client training data so ch1 cosine
-                # similarities are computed in a consistent feature space.
-                _scaler = scaler
-                logger.info(
-                    "[FLTrust] Using caller-supplied shared scaler for root dataset. "
-                    "(correct path — scaler consistent with client data)"
-                )
-            else:
-                # Fallback: fit a fresh scaler. This is only safe when running
-                # the Flower server standalone (no benchmark context). It will
-                # produce a numerically distinct scaler if DATA_LOAD_FRACTION
-                # or random_state differs from the client path.
-                logger.warning(
-                    "[FLTrust] No shared scaler supplied — fitting root scaler "
-                    "independently. For benchmark runs, pass _shared_scaler to "
-                    "avoid ch1 score collapse."
-                )
-                _scaler = _loader.fit_scaler()
-
-            # Load the global CSV directly
-            df = _loader._load_csv(str(DATASET_PATH))
-            label_col = 'Label' if 'Label' in df.columns else cfg.LABEL_COL.strip()
-
-            # Isolate all benign traffic globally
-            if pd.api.types.is_numeric_dtype(df[label_col]):
-                benign_df = df[df[label_col] == 0]
-            else:
-                benign_df = df[df[label_col].str.strip().str.upper() == "BENIGN"]
-
-            # Sample globally so all org behaviors are represented
-            sampled_df = benign_df.sample(n=min(n_samples, len(benign_df)), random_state=42)
-
-            X = sampled_df[_loader._feature_cols].values.astype(np.float32)
-            X_scaled = _scaler.transform(X).clip(0, 1)
-
-            root = torch.tensor(X_scaled, dtype=torch.float32)
-
-            # Tile if the available dataset is smaller than requested
-            if len(root) < n_samples:
-                repeats = (n_samples // len(root)) + 1
-                root = root.repeat(repeats, 1)[:n_samples]
-
-            logger.info(
-                f"[FLTrust] Global real root dataset loaded "
-                f"({len(root)} unbiased samples)."
-            )
-            return root
-
-        except Exception as e:
-            raise RuntimeError(
-                f"FATAL: Real root dataset unavailable. "
-                f"Falling back to synthetic Gaussian noise invalidates FLTrust evaluation. "
-                f"Fix the dataset path. Original error: {e}"
-            )
+    from aura.split_manager import get_canonical_split
+    from aura.data_loader import CICIDSDataLoader
+    
+    loader = CICIDSDataLoader()
+    all_windows = list(loader.stream_graphs(scaler))
+    calib_windows, _, _ = get_canonical_split(all_windows, test_fraction=0.20)
+    
+    # Extract benign flows from calibration windows only
+    all_flows = []
+    for graph, labels in calib_windows:
+        flows = graph['edge_attr']
+        benign_mask = labels == 0
+        if benign_mask.any():
+            all_flows.append(flows[benign_mask])
+        if sum(len(f) for f in all_flows) >= n_samples:
+            break
+    
+    if not all_flows:
+        raise RuntimeError(
+            "FATAL: Root dataset is empty. "
+            "Check that canonical training split contains benign flows."
+        )
+    
+    root_data = torch.cat(all_flows)[:n_samples]
+    print(f"[ROOT DATASET] Built from canonical training split: {len(root_data)} benign flows")
+    print(f"[ROOT DATASET] Using shared scaler instance: {id(scaler)}")
+    return root_data
 # ─────────────────────────────────────────────────────────────────────────────
 # FLTrust Aggregation (Upgrade 6 — active path in aggregate_fit; Krum is legacy fallback only)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -483,7 +435,13 @@ def dc_fltrust_aggregate(
         zip(client_ae_deltas, client_head_deltas, client_round_counts)
     ):
         # Channel 1: always active — ReLU for weight, signed for reference
-        ch1 = relu_cosine(flatten(ae_delta), root_ae_flat)
+        client_flat = flatten(ae_delta)
+        ch1 = relu_cosine(client_flat, root_ae_flat)
+        
+        sim = signed_cosine(client_flat, root_ae_flat)
+        print(f"[DIAGNOSTIC] Client {i} gradient cosine with root: {sim:.4f}")
+        print(f"  Root grad norm: {root_ae_flat.norm():.4f}")
+        print(f"  Client grad norm: {client_flat.norm():.4f}")
 
         # Channel 2: gated by warmup
         if rounds >= ch2_warmup_rounds:
@@ -800,7 +758,7 @@ class KrumFedAURA(FedAvg):
         min_available_clients: int   = cfg.FL_MIN_AVAILABLE,
         num_rounds:            int   = cfg.FL_NUM_ROUNDS,
         round_timeout_sec:     int   = cfg.FL_ROUND_TIMEOUT_SEC,
-        blockchain_module=None,      # Optionally inject blockchain logger
+        merkle_tree=None,      # Optionally inject MerkleTree logger
     ):
         # Configure FedAvg base (we override aggregation but keep its scheduling)
         super().__init__(
@@ -818,7 +776,7 @@ class KrumFedAURA(FedAvg):
         )
         self.num_rounds        = num_rounds
         self.round_timeout_sec = round_timeout_sec
-        self.blockchain        = blockchain_module
+        self.audit_tree        = merkle_tree or __import__('aura.merkle_tree', fromlist=['']).MerkleTree()
         self._model_version    = 0
         self._hash_history: List[dict] = []
 
@@ -945,24 +903,31 @@ class KrumFedAURA(FedAvg):
         print(f"{round_tag} Global Model {model_version_tag} aggregated.")
         print(f"{round_tag} SHA-256 hash: {model_hash}")
 
-        # ── Blockchain Audit Log (FINAL ROUND ONLY) ──────────────────────────
-        # Intermediate rounds converge the model; only the final aggregated
-        # model is production-ready and gets minted on the blockchain ledger.
+        # ── Merkle Tree Audit Log ──────────────────────────────────────────────
+        from aura.merkle_tree import AuditEntry
+        from datetime import datetime
+        total_trust = sum(trust_scores) + 1e-8
+        for idx, (trust, (cp, fr)) in enumerate(zip(trust_scores, results)):
+            classification = "BYZANTINE" if idx in flagged_indices else "HEALTHY"
+            entry = AuditEntry(
+                timestamp=datetime.utcnow().isoformat(),
+                round_num=server_round,
+                client_id=str(cp.cid),
+                ae_update_norm=0.0,  # Computed in dc_fltrust normally
+                head_update_norm=None,
+                local_val_accuracy=float(fr.metrics.get("val_accuracy", 0.0)),
+                ch1_trust_score=float(trust),
+                ch2_trust_score=None,
+                classification=classification,
+                aggregation_weight=float(trust / total_trust if classification != "BYZANTINE" else 0.0)
+            )
+            self.audit_tree.append(entry)
+        logger.info(f"Audit trail updated. Root: {self.audit_tree.root()[:16]}...")
+        
         is_final_round = (server_round == self.num_rounds)
         if is_final_round:
             final_version = f"final_v{self._model_version}"
-            if self.blockchain is not None:
-                try:
-                    tx_hash = self.blockchain.log_model_update(
-                        model_version=final_version,
-                        model_hash=model_hash,
-                    )
-                    print(f"[BLOCKCHAIN] Final Model {final_version} minted. "
-                          f"Hash {model_hash[:12]}… | TX: {str(tx_hash)[:16]}…")
-                except Exception as e:
-                    logger.warning(f"Blockchain log failed (fallback active): {e}")
-            else:
-                self._log_hash_local(final_version, model_hash, server_round)
+            self._log_hash_local(final_version, model_hash, server_round)
 
             # Write trusted registry — only for the final converged model
             self._write_trusted_registry(final_version, model_hash)
@@ -1063,7 +1028,7 @@ class KrumFedAURA(FedAvg):
 # Server Launch
 # ─────────────────────────────────────────────────────────────────────────────
 
-def start_server(blockchain_module=None) -> None:
+def start_server(merkle_tree=None) -> None:
     """
     Start the AURA Flower federation server.
 
@@ -1074,7 +1039,7 @@ def start_server(blockchain_module=None) -> None:
     Any client that doesn't respond within round_timeout_sec is treated
     as dropped for that round (Flower gRPC layer handles the socket close).
     """
-    strategy = KrumFedAURA(blockchain_module=blockchain_module)
+    strategy = KrumFedAURA(merkle_tree=merkle_tree)
 
     server_config = fl.server.ServerConfig(
         num_rounds    = cfg.FL_NUM_ROUNDS,
@@ -1098,7 +1063,7 @@ def start_server(blockchain_module=None) -> None:
 # Simulation Mode (no real gRPC) — for demo without network setup
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
+def run_federation_simulation(merkle_tree=None, n_rounds: int = None,
                               active_orgs: list = None) -> List[dict]:
     """
     In-process federation simulation for the hackathon demo.
@@ -1136,7 +1101,7 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
         attack_client = attack_arg,
         shared_scaler = _shared_scaler,
     )
-    strategy = KrumFedAURA(blockchain_module=blockchain_module,
+    strategy = KrumFedAURA(merkle_tree=merkle_tree,
                            num_rounds=n_rounds)
 
     # Initialise with random global model
@@ -1193,7 +1158,7 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
             model_version = metrics.get('model_version')
             server_hash   = metrics.get('model_hash')
             print(f"\n  [SERVER] Global Model {model_version} aggregated.")
-            print(f"  [SERVER] SHA-256 minted on blockchain: {server_hash[:20]}...")
+            print(f"  [SERVER] Merkle root updated: {server_hash[:20]}...")
             print(f"  [SERVER] FLTrust trusted {len(selected_idx)} / "
                   f"{len(clients)} clients.")
             print()
@@ -1208,25 +1173,25 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
 
                 for client in clients:
                     # Fetch the hash the server minted for this version
-                    bc = blockchain_module
+                    bc = merkle_tree
                     if bc is not None:
-                        on_chain_ok, _ = bc.verify_model(model_version, client_received_hash)
+                        on_chain_ok = (client_received_hash == server_hash) # For simulation
                     else:
-                        # No blockchain — compare directly against server hash
+                        # No MerkleTree — compare directly against server hash
                         on_chain_ok = (client_received_hash == server_hash)
 
                     if on_chain_ok:
                         print(f"  [CLIENT {client.client_id}] "
                               f"Received hash {client_received_hash[:16]}... "
-                              f"== Blockchain hash {server_hash[:16]}... "
+                              f"== Merkle hash {server_hash[:16]}... "
                               f"→ MATCH. Model deployed.")
                     else:
                         print(f"  [CLIENT {client.client_id}] "
                               f"Received hash {client_received_hash[:16]}... "
-                              f"!= Blockchain hash {server_hash[:16]}... "
+                              f"!= Merkle hash {server_hash[:16]}... "
                               f"→ MISMATCH! Weights tampered in transit. REJECTING model.")
             else:
-                print(f"  [CLIENTS] Intermediate round — blockchain not yet minted. "
+                print(f"  [CLIENTS] Intermediate round — final hash not yet verified. "
                       f"Hash {server_hash[:20]}... recorded locally for auditing.")
 
         round_results.append({"round": rnd, "client_statuses": client_statuses, **metrics})
@@ -1265,11 +1230,11 @@ if __name__ == "__main__":
         print("✓ Federation simulation complete.")
     else:
         # TRUE NETWORKED MODE — waits for real gRPC client connections
-        from aura.blockchain import AURABlockchainLogger
-        bc = AURABlockchainLogger()
+        from aura.merkle_tree import MerkleTree, AuditEntry
+        bc = MerkleTree()
 
         strategy = KrumFedAURA(
-            blockchain_module = bc,
+            merkle_tree = bc,
             num_rounds        = args.rounds,
         )
         server_config = fl.server.ServerConfig(

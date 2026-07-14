@@ -25,7 +25,7 @@ from aura.models import FlowAutoencoder, AuraSTGNN, AURAModelBundle
 from aura.detector import AURAInferenceEngine, AlertSeverity, AnomalyEvent
 from aura.response_engine import AURAResponseEngine
 from aura.attack_injector import AttackInjector
-from aura.blockchain import AURABlockchainLogger
+from aura.merkle_tree import MerkleTree
 
 THEME = {
     "bg": "#0a0e1a",
@@ -72,7 +72,7 @@ class DashboardService:
         self.engine: Optional[AURAInferenceEngine] = None
         self.responder: Optional[AURAResponseEngine] = None
         self.injector: Optional[AttackInjector] = None
-        self.blockchain: Optional[AURABlockchainLogger] = None
+        self.merkle_tree: Optional[MerkleTree] = None
         self.model_status = "INITIALISING"
 
         self.ae_scores: List[float] = []
@@ -123,17 +123,11 @@ class DashboardService:
         self.responder = AURAResponseEngine()
         self.injector = AttackInjector()
         try:
-            self.blockchain = AURABlockchainLogger()
+            self.merkle_tree = MerkleTree()
         except Exception as e:
             logging.getLogger(__name__).warning(
-                f"Blockchain logger init failed ({e}); using minimal fallback."
+                f"MerkleTree logger init failed ({e})."
             )
-            self.blockchain = AURABlockchainLogger.__new__(AURABlockchainLogger)
-            self.blockchain._mode = "local_fallback"
-            self.blockchain._w3 = None
-            self.blockchain._contract = None
-            self.blockchain._account = None
-            self.blockchain._local_store = {}
 
         # Warmup: use realistic benign traffic profiles when dataset is available
         # so the EMA baseline is grounded in real normal-traffic statistics.
@@ -369,8 +363,8 @@ class DashboardService:
         with self._state_lock:
             self._fl_running = True
             self.fed_log = ["🚀 Federation round initiated …"]
-            bc_module = self.blockchain
-            round_results = run_federation_simulation(blockchain_module=bc_module, n_rounds=cfg.FL_NUM_ROUNDS)
+            mt_module = self.merkle_tree
+            round_results = run_federation_simulation(merkle_tree=mt_module, n_rounds=cfg.FL_NUM_ROUNDS)
 
             for r in round_results:
                 rnd      = r.get("round", "?")
@@ -401,7 +395,7 @@ class DashboardService:
                     f"[SERVER] FLTrust: {kept}/{total_clients} client updates trusted "
                     f"(cosine vs server root).",
                     f"[SERVER] Global Model {version} aggregated.",
-                    f"[BLOCKCHAIN] Hash recorded: {h[:20]}…",
+                    f"[MERKLE TREE] Hash recorded: {h[:20]}…",
                 ]
                 # Client verification entries from actual participants
                 for cs in statuses:
@@ -425,10 +419,11 @@ class DashboardService:
             return {"status": "ok", "rounds": len(round_results)}
 
     def register_test_hash(self) -> dict:
-        assert self.blockchain
+        assert self.merkle_tree
         fake_hash = "0x" + hashlib.sha256(str(time.time()).encode()).hexdigest()
         ver = f"manual_{int(time.time())}"
-        self.blockchain.log_model_update(ver, fake_hash)
+        # self.merkle_tree.log_model_update(ver, fake_hash) - MerkleTree records entries per client, not per model version manually.
+        # So we skip explicit manual logging for the demo test hash and just add a log entry.
         entry = {"version": ver, "hash": fake_hash, "round": "manual", "time": time.strftime("%H:%M:%S")}
         self.chain_log.insert(0, entry)
         self.chain_entries = len(self.chain_log)
@@ -519,7 +514,7 @@ class DashboardService:
                 }
 
             current_ae = self.ae_scores[-1] if self.ae_scores else 0.0
-            bc_mode = self.blockchain.mode.upper() if self.blockchain else "UNKNOWN"
+            bc_mode = "MERKLE_TREE" if self.merkle_tree else "UNKNOWN"
 
             return {
                 "system_status": self.system_status,
