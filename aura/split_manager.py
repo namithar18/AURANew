@@ -47,10 +47,11 @@ def get_canonical_split(
     all_windows: List[Tuple],
     test_fraction: float = cfg.TEST_SPLIT_FRACTION,
     calib_fraction: float = cfg.CALIB_SPLIT_FRACTION,
+    server_attack_fraction: float = 0.05,
     force_recompute: bool = False,
-) -> Tuple[List, List, List]:
+) -> Tuple[List, List, List, List]:
     """
-    Return (calibration_windows, train_windows, test_windows) using a single
+    Return (calibration_windows, train_windows, test_windows, server_attack_windows) using a single
     canonical train/test split that is saved to disk and reused across scripts.
 
     Parameters
@@ -59,6 +60,8 @@ def get_canonical_split(
     test_fraction : fraction of windows held out as test (default 0.20).
     calib_fraction : fraction of *train* windows used for threshold calibration
                      (default 0.10). Taken from the start of train_windows.
+    server_attack_fraction : fraction of *attack-containing* windows used for the
+                             server's DC-FLTrust reference direction (default 0.05).
     force_recompute : if True, discard any saved split and recompute from scratch.
 
     Returns
@@ -66,6 +69,7 @@ def get_canonical_split(
     calibration_windows : list (subset of train_windows, used for AE/GNN calibration)
     train_windows       : list
     test_windows        : list
+    server_attack_windows: list (never intersects with train or test)
     """
     total = len(all_windows)
     if total == 0:
@@ -75,18 +79,18 @@ def get_canonical_split(
     if _SPLIT_FILE.exists() and not force_recompute:
         data = np.load(_SPLIT_FILE)
         saved_total = int(data["total"])
-        if saved_total == total:
+        if saved_total == total and "server_attack_idx" in data:
             train_idx = data["train_idx"].tolist()
             test_idx  = data["test_idx"].tolist()
+            server_attack_idx = data["server_attack_idx"].tolist()
             logger.info(
                 f"[split_manager] Loaded canonical split from {_SPLIT_FILE} "
-                f"(total={total}, train={len(train_idx)}, test={len(test_idx)})"
+                f"(total={total}, train={len(train_idx)}, test={len(test_idx)}, server_attack={len(server_attack_idx)})"
             )
-            return _build_output(all_windows, train_idx, test_idx, calib_fraction)
+            return _build_output(all_windows, train_idx, test_idx, server_attack_idx, calib_fraction)
         else:
             logger.warning(
-                f"[split_manager] Saved split has total={saved_total} but current "
-                f"dataset has {total} windows. Recomputing split."
+                f"[split_manager] Saved split mismatch or old format. Recomputing split."
             )
 
     # ── Compute stratified chronological split ──────────────────────────────
@@ -96,11 +100,19 @@ def get_canonical_split(
     attack_idx = [i for i, (_, lbl) in enumerate(all_windows) if lbl.sum() > 0]
     benign_idx = [i for i, (_, lbl) in enumerate(all_windows) if lbl.sum() == 0]
 
+    # Reserve server attack windows from attack-containing windows (from the middle)
+    n_server = max(1, int(len(attack_idx) * server_attack_fraction))
+    mid = len(attack_idx) // 2
+    server_attack_idx = attack_idx[mid - n_server//2 : mid + n_server//2]
+    
+    # Remaining attack windows
+    remaining_attack_idx = [i for i in attack_idx if i not in set(server_attack_idx)]
+
     def _chrono_split(indices: list) -> Tuple[list, list]:
         cut = int(len(indices) * (1.0 - test_fraction))
         return indices[:cut], indices[cut:]
 
-    atk_train, atk_test = _chrono_split(attack_idx)
+    atk_train, atk_test = _chrono_split(remaining_attack_idx)
     ben_train, ben_test = _chrono_split(benign_idx)
 
     train_idx = sorted(atk_train + ben_train)
@@ -113,24 +125,27 @@ def get_canonical_split(
         total=np.array(total),
         train_idx=np.array(train_idx, dtype=np.int64),
         test_idx=np.array(test_idx,  dtype=np.int64),
+        server_attack_idx=np.array(server_attack_idx, dtype=np.int64),
     )
     logger.info(
         f"[split_manager] Canonical split saved to {_SPLIT_FILE} "
-        f"(total={total}, train={len(train_idx)}, test={len(test_idx)})"
+        f"(total={total}, train={len(train_idx)}, test={len(test_idx)}, server_attack={len(server_attack_idx)})"
     )
 
-    return _build_output(all_windows, train_idx, test_idx, calib_fraction)
+    return _build_output(all_windows, train_idx, test_idx, server_attack_idx, calib_fraction)
 
 
 def _build_output(
     all_windows: List[Tuple],
     train_idx: List[int],
     test_idx: List[int],
+    server_attack_idx: List[int],
     calib_fraction: float,
-) -> Tuple[List, List, List]:
+) -> Tuple[List, List, List, List]:
     """Materialise the window lists and derive the calibration subset."""
     train_windows = [all_windows[i] for i in train_idx]
     test_windows  = [all_windows[i] for i in test_idx]
+    server_attack_windows = [all_windows[i] for i in server_attack_idx]
 
     n_calib = max(5, int(len(train_windows) * calib_fraction))
     calibration_windows = train_windows[:n_calib]
@@ -138,15 +153,19 @@ def _build_output(
     logger.info(
         f"[split_manager] train={len(train_windows)}, "
         f"test={len(test_windows)}, "
-        f"calib={len(calibration_windows)}"
+        f"calib={len(calibration_windows)}, "
+        f"server_attack={len(server_attack_windows)}"
     )
 
     # Sanity check — never allow index overlap (would mean data leakage)
-    overlap = set(train_idx) & set(test_idx)
-    if overlap:
+    train_set = set(train_idx)
+    test_set = set(test_idx)
+    server_set = set(server_attack_idx)
+    
+    if train_set & test_set or train_set & server_set or test_set & server_set:
         raise RuntimeError(
-            f"[split_manager] FATAL: {len(overlap)} indices appear in both "
-            "train and test sets. The split is corrupt."
+            f"[split_manager] FATAL: Index overlap detected among train/test/server_attack sets. "
+            "The split is corrupt."
         )
 
-    return calibration_windows, train_windows, test_windows
+    return calibration_windows, train_windows, test_windows, server_attack_windows

@@ -387,7 +387,7 @@ def collect_test_windows(
             f"{cfg.CSV_DIR} and DATA_LOAD_FRACTION ({cfg.DATA_LOAD_FRACTION}) is sufficient."
         )
 
-    calibration_windows, train_windows, test_windows = get_canonical_split(
+    calibration_windows, train_windows, test_windows, _ = get_canonical_split(
         all_windows, test_fraction=test_fraction
     )
 

@@ -72,7 +72,7 @@ try:
     all_windows = list(_loader.stream_graphs(_shared_scaler))
 
     # Get canonical train/test split
-    calib_windows, train_windows, test_windows = get_canonical_split(
+    calib_windows, train_windows, test_windows, server_attack_windows = get_canonical_split(
         all_windows, test_fraction=0.20
     )
     
@@ -189,7 +189,8 @@ def _run_local_training_dual(
     global_ae_weights: dict,
     global_head_weights: dict,
     mse_threshold_high: float,
-    head_epochs: int = 3
+    head_epochs: int = 3,
+    batch_size: int = 256
 ) -> tuple:
     from aura.local_training import run_two_pass_local_training
     
@@ -197,7 +198,8 @@ def _run_local_training_dual(
         ae, attack_head, all_flows,
         ae_optimizer, head_optimizer,
         mse_threshold=mse_threshold_high,
-        head_epochs=head_epochs
+        head_epochs=head_epochs,
+        batch_size=batch_size
     )
     
     assert n_benign > 0 or n_high_mse > 0, "FATAL: No flows processed in two-pass training"
@@ -317,7 +319,7 @@ def run_experiment(
     global_arrays = [p.detach().cpu().numpy() for p in global_model.parameters()]
 
     # FLTrust server root dataset (benign reference -- built once per experiment)
-    root_data = _build_root_dataset(_shared_scaler, n_samples=2000)
+    root_data, _ = _build_root_dataset(_shared_scaler, n_samples=2000)
 
     # Federated rounds
     from aura.attack_reference import AttackReferenceBuffer
@@ -466,8 +468,16 @@ def run_experiment(
             g_ae_w = {k: v.clone() for k, v in global_model.autoencoder.state_dict().items()}
             g_head_w = {k: v.clone() for k, v in global_model.attack_head.state_dict().items()}
             
-            r_ae_delta, r_head_delta, _, _, _ = _run_local_training_dual(
-                root_ae, root_head, root_data, root_ae_opt, root_head_opt, g_ae_w, g_head_w, mse_threshold_high=cfg.CH2_MSE_SPLIT_THRESHOLD
+            r_ae_delta, _, _, _, _ = _run_local_training_dual(
+                root_ae, root_head, root_data, root_ae_opt, root_head_opt, g_ae_w, g_head_w, mse_threshold_high=cfg.CH2_MSE_SPLIT_THRESHOLD, batch_size=-1
+            )
+            
+            from aura.root_gradient import _build_root_head_reference
+            r_head_delta = _build_root_head_reference(
+                server_attack_windows=server_attack_windows,
+                ae=global_model.autoencoder,
+                global_head_weights=g_head_w,
+                mse_threshold=cfg.CH2_MSE_SPLIT_THRESHOLD
             )
             
             c_ae_deltas = []
@@ -515,6 +525,10 @@ def run_experiment(
                 )
             
             client_round_counts = [rnd] * num_clients
+            
+            root_head_flat = torch.cat([v.flatten() for v in r_head_delta.values()])
+            print(f"[DIAGNOSTIC] root_head_delta norm: {root_head_flat.norm():.6f}")
+            print(f"[DIAGNOSTIC] root_ae_delta norm: {torch.cat([v.flatten() for v in r_ae_delta.values()]).norm():.6f}")
             
             if mode == 'ae_only':
                 new_ae, trust_scores = ae_only_fltrust_aggregate(

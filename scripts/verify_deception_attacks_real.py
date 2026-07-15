@@ -289,7 +289,7 @@ def main():
         global_ae.load_state_dict(torch.load(ae_path, map_location='cpu'))
     
     from aura.split_manager import get_canonical_split
-    _, train_windows, test_windows = get_canonical_split(list(loader.stream_graphs(scaler)), test_fraction=0.20)
+    _, train_windows, test_windows, _ = get_canonical_split(list(loader.stream_graphs(scaler)), test_fraction=0.20)
     
     test_flows, test_labels = build_auroc_test_set(global_ae, test_windows, n_benign=500, n_attack=200)
     

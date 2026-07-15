@@ -198,7 +198,7 @@ def _build_root_dataset(scaler, n_samples=5000):
     
     loader = CICIDSDataLoader()
     all_windows = list(loader.stream_graphs(scaler))
-    calib_windows, _, _ = get_canonical_split(all_windows, test_fraction=0.20)
+    calib_windows, _, _, server_attack_windows = get_canonical_split(all_windows, test_fraction=0.20)
     
     # Extract benign flows from calibration windows only
     all_flows = []
@@ -218,8 +218,9 @@ def _build_root_dataset(scaler, n_samples=5000):
     
     root_data = torch.cat(all_flows)[:n_samples]
     print(f"[ROOT DATASET] Built from canonical training split: {len(root_data)} benign flows")
-    print(f"[ROOT DATASET] Using shared scaler instance: {id(scaler)}")
-    return root_data
+    if scaler is not None:
+        print(f"[ROOT DATASET] Using shared scaler instance: {id(scaler)}")
+    return root_data, server_attack_windows
 # ─────────────────────────────────────────────────────────────────────────────
 # FLTrust Aggregation (Upgrade 6 — active path in aggregate_fit; Krum is legacy fallback only)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -782,7 +783,7 @@ class KrumFedAURA(FedAvg):
 
         # FLTrust root dataset — generated once, reused every round.
         # This is the server's small trusted benign baseline.
-        self._root_data: torch.Tensor = _build_root_dataset()
+        self._root_data, self._server_attack_windows = _build_root_dataset()
         # Global model reference — updated after each successful aggregation.
         # FLTrust needs the current global state to compute per-client deltas.
         self._global_model: AURAModelBundle = AURAModelBundle()
@@ -912,29 +913,15 @@ class KrumFedAURA(FedAvg):
                                             self._global_model.autoencoder.parameters()))
         }
         
-        # Compute root head delta: run root data through AE encoder to get z vectors,
-        # then one gradient step on AttackHead
-        server_model.autoencoder.eval()
-        with torch.no_grad():
-            _, z_root = server_model.autoencoder(self._root_data)
-        
-        head_opt = torch.optim.Adam(server_model.attack_head.parameters(),
-                                    lr=cfg.FLTRUST_SERVER_LR)
-        server_model.attack_head.train()
-        head_opt.zero_grad()
-        preds = server_model.attack_head(z_root).squeeze()
-        # Pseudo-label 0.0 — root data is benign, so attack probability should be low
-        pseudo_labels = torch.zeros_like(preds)
-        head_loss = nn.functional.binary_cross_entropy(preds, pseudo_labels)
-        head_loss.backward()
-        head_opt.step()
-        server_model.attack_head.eval()
-        
-        root_head_delta = {
-            f"layer_{i}": (p.detach().cpu() - gp.detach().cpu()).float()
-            for i, (p, gp) in enumerate(zip(server_model.attack_head.parameters(),
-                                            self._global_model.attack_head.parameters()))
-        }
+        # Compute root head delta using reserved attack flows
+        from aura.root_gradient import _build_root_head_reference
+        root_head_delta = _build_root_head_reference(
+            server_attack_windows=self._server_attack_windows,
+            ae=server_model.autoencoder,
+            global_head_weights={k: v.clone() for k, v in self._global_model.attack_head.state_dict().items()},
+            mse_threshold=getattr(cfg, 'CH2_MSE_SPLIT_THRESHOLD', cfg.MSE_THRESHOLD_HIGH),
+            server_lr=cfg.FLTRUST_SERVER_LR
+        )
 
         client_round_counts = [server_round] * n_received
 

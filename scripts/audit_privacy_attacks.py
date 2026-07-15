@@ -155,7 +155,7 @@ def _build_three_pools(seed: int):
     scaler = loader.fit_scaler()
     all_windows = list(loader.stream_graphs(scaler))
 
-    calib_windows, train_windows, test_windows = get_canonical_split(all_windows)
+    calib_windows, train_windows, test_windows, _ = get_canonical_split(all_windows)
 
     def _extract_flows(windows):
         tensors = []

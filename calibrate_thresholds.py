@@ -154,7 +154,7 @@ def collect_normal_mse(ae: FlowAutoencoder) -> np.ndarray:
     # get_canonical_split saves indices to splits/canonical_split.npz and
     # reloads them on subsequent runs — same split as train.py and
     # benchmark_ablation.py.
-    _, train_windows, _ = get_canonical_split(all_windows, test_fraction=cfg.TEST_SPLIT_FRACTION)
+    _, train_windows, _, _ = get_canonical_split(all_windows, test_fraction=cfg.TEST_SPLIT_FRACTION)
 
     log.info(
         f"Canonical split: {len(train_windows)} train windows / "

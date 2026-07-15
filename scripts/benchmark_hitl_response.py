@@ -414,7 +414,7 @@ class ResponseBenchmark:
             ))
         if not all_windows:
             raise RuntimeError("No windows produced. Check CSV paths in config.py.")
-        _, _, test_windows = get_canonical_split(
+        _, _, test_windows, _ = get_canonical_split(
             all_windows, test_fraction=self.test_fraction
         )
         atk = sum(lbl.sum().item() for _, lbl in test_windows)
