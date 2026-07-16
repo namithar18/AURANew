@@ -53,7 +53,7 @@ def collect_test_windows(loader: CICIDSDataLoader, scaler) -> list:
     if not all_windows:
         return []
 
-    _, _, test_windows = get_canonical_split(all_windows)
+    _, _, test_windows, _ = get_canonical_split(all_windows)
     return test_windows
 
 

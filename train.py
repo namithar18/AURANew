@@ -201,7 +201,7 @@ def main():
     # Use the canonical split so train.py and benchmark_ablation.py see
     # identical train/test partitions.  The split is saved to
     # splits/canonical_split.npz and reloaded on every subsequent run.
-    _, train_windows, _ = get_canonical_split(all_windows, test_fraction=cfg.TEST_SPLIT_FRACTION)
+    _, train_windows, _, _ = get_canonical_split(all_windows, test_fraction=cfg.TEST_SPLIT_FRACTION)
 
     # Extract edge-level benign flows from the canonical *train* windows only.
     # Never include flows from the test windows in the AE training set.

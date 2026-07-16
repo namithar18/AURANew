@@ -55,7 +55,7 @@ LABEL_COL = "Label"
 BENIGN_LABEL = 0
 
 # Fraction of data to load per CSV (1.0 = all rows; reduce for speed during dev)
-DATA_LOAD_FRACTION = 1   # 30 % is enough to demo; use 1.0 for full training
+DATA_LOAD_FRACTION = 0.3   # 30 % is enough to demo; use 1.0 for full training
 
 # Fraction of windows held out for test set in canonical split
 TEST_SPLIT_FRACTION = 0.20
@@ -780,3 +780,4 @@ def preflight_dc_fltrust_check():
     print(f"  Attack classes present: {list(profiles.keys())}")
     print(f"  This timestamp should match your most recent train_explainer.py run.")
     return True
+CH2_WARMUP_ROUNDS = 10

@@ -113,26 +113,51 @@ def threshold_mia(model, member, nonmember):
             "threshold": float(scores.mean())}
 
 
-def shadow_model_mia(victim, member, nonmember, n_shadows=6, n_per=200):
-    print(f"  Training {n_shadows} shadow AEs …")
+def shadow_model_mia(victim, member, nonmember, n_shadows=6, n_per=200,
+                     shadow_data=None):
+    """
+    Shadow model MIA (Shokri et al. 2017).
+
+    Parameters
+    ----------
+    shadow_data : Tensor, optional
+        Real held-out flows for shadow model training/holdout.
+        If provided, split 50/50 into shadow train vs shadow holdout.
+        If None (default), falls back to synthetic torch.randn — WARNING:
+        this produces near-random AUROC because the distribution mismatch
+        between synthetic and real data breaks the meta-classifier.
+    """
+    print(f"  Training {n_shadows} shadow AEs ...")
     X, y = [], []
     for i in range(n_shadows):
-        g1 = torch.Generator().manual_seed(200+i)
-        g2 = torch.Generator().manual_seed(800+i)
-        tr  = torch.randn(n_per, FEATURE_DIM, generator=g1)
-        hld = torch.randn(n_per, FEATURE_DIM, generator=g2)
-        sh  = _train_shadow(tr)
+        g1 = torch.Generator().manual_seed(200 + i)
+        g2 = torch.Generator().manual_seed(800 + i)
+
+        if shadow_data is not None:
+            # Real data: split into disjoint train/holdout for this shadow
+            n = min(n_per, len(shadow_data) // 2)
+            perm = torch.randperm(len(shadow_data),
+                                  generator=torch.Generator().manual_seed(42 + i))
+            tr  = shadow_data[perm[:n]]
+            hld = shadow_data[perm[n:2 * n]]
+        else:
+            # Synthetic fallback — use only when no real shadow data available.
+            # NOTE: produces near-random AUROC due to distribution mismatch.
+            tr  = torch.randn(n_per, FEATURE_DIM, generator=g1)
+            hld = torch.randn(n_per, FEATURE_DIM, generator=g2)
+
+        sh = _train_shadow(tr)
         X += [sh.recon_error(tr).unsqueeze(1),
               sh.recon_error(hld).unsqueeze(1)]
-        y += [1]*n_per + [0]*n_per
+        y += [1] * len(tr) + [0] * len(hld)
 
     clf = LogisticRegression()
     clf.fit(torch.cat(X).numpy(), y)
 
     X_te = torch.cat([victim.recon_error(member).unsqueeze(1),
                       victim.recon_error(nonmember).unsqueeze(1)]).numpy()
-    y_te = [1]*len(member) + [0]*len(nonmember)
-    return {"auc":      roc_auc_score(y_te, clf.predict_proba(X_te)[:,1]),
+    y_te = [1] * len(member) + [0] * len(nonmember)
+    return {"auc":      roc_auc_score(y_te, clf.predict_proba(X_te)[:, 1]),
             "accuracy": accuracy_score(y_te, clf.predict(X_te))}
 
 

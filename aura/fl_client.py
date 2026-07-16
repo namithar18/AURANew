@@ -93,14 +93,25 @@ def hash_model_weights(arrays: List[np.ndarray]) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def model_to_ndarrays(model: nn.Module) -> List[np.ndarray]:
-    """Extract model parameters as a list of NumPy arrays (Flower format)."""
-    return [p.detach().cpu().numpy() for p in model.parameters()]
-
+    """Serialize AE + AttackHead parameters as a single flat list.
+    Layout: first 12 tensors = AE, next 4 tensors = AttackHead.
+    Server unpacks by position. GraphSAGE is strictly local — never serialized.
+    """
+    ae_arrays   = [p.detach().cpu().numpy() for p in model.autoencoder.parameters()]
+    head_arrays = [p.detach().cpu().numpy() for p in model.attack_head.parameters()]
+    return ae_arrays + head_arrays
 
 def ndarrays_to_model(model: nn.Module, arrays: List[np.ndarray]) -> None:
-    """Load a list of NumPy arrays into model parameters (in-place)."""
+    """Load AE + AttackHead parameters from unified Flower payload.
+    Layout: first 12 = AE, next 4 = AttackHead. Matches model_to_ndarrays.
+    """
+    n_ae = len(list(model.autoencoder.parameters()))
+    ae_arrays   = arrays[:n_ae]
+    head_arrays = arrays[n_ae:]
     with torch.no_grad():
-        for p, arr in zip(model.parameters(), arrays):
+        for p, arr in zip(model.autoencoder.parameters(), ae_arrays):
+            p.copy_(torch.tensor(arr))
+        for p, arr in zip(model.attack_head.parameters(), head_arrays):
             p.copy_(torch.tensor(arr))
 
 
@@ -161,7 +172,7 @@ def _verify_global_weights(
     1. (Demo) Optionally tamper weights to simulate MITM attack.
     2. Compute SHA-256 hash of the (possibly tampered) weights.
     3. Print high-visibility security audit output.
-    4. Simulate verification against Ganache smart contract ledger.
+    4. Simulate verification against Merkle tree audit log.
 
     Parameters
     ----------
@@ -195,11 +206,11 @@ def _verify_global_weights(
     print(f"  [SECURITY AUDIT] Computed SHA-256: {computed_hash}")
     print(f"{'═'*60}")
 
-    # ── Verification against Ganache smart contract ledger ───────────────
+    # ── Verification against Merkle tree audit log ───────────────────────
     # In production, this would call:
-    #   blockchain.verify_model(version, computed_hash)
+    #   merkle_tree.verify_integrity() and check the root
     # For the demo, we read the server's trusted hash registry and compare.
-    print(f"  [SECURITY AUDIT] Verifying hash against Ganache smart contract ledger …")
+    print(f"  [SECURITY AUDIT] Verifying hash against Merkle tree audit log …")
 
     registry_path = Path(cfg.LOGS_DIR) / "hash_registry.json"
     ledger_hash = None
@@ -231,7 +242,7 @@ def _verify_global_weights(
     # ── Normal path: hash matches ────────────────────────────────────────
     if ledger_hash:
         if computed_hash == ledger_hash:
-            print(f"  [SECURITY AUDIT] ✅ Hash matches Ganache ledger entry ({ledger_hash[:16]}…)")
+            print(f"  [SECURITY AUDIT] ✅ Hash matches Merkle tree entry ({ledger_hash[:16]}…)")
         else:
             # Hash doesn't match ledger but this isn't MITM — could be
             # intermediate round (ledger only has final round hash).
@@ -415,7 +426,7 @@ class AURAFlowerClient(fl.client.Client):
         Evaluate the received global weights on local validation data.
 
         The client verifies the integrity of received weights via SHA-256
-        hash comparison with the blockchain ledger before loading them.
+        hash comparison with the Merkle tree before loading them.
         """
         # Step 1: Deserialize global model parameters
         arrays = parameters_to_ndarrays(ins.parameters)
@@ -454,165 +465,50 @@ class AURAFlowerClient(fl.client.Client):
     # ------------------------------------------------------------------
 
     def _local_train(self) -> Tuple[int, float]:
-        """
-        Run unsupervised autoencoder training on local data.
-
-        We train in batch mode — the autoencoder learns to reconstruct
-        the local network's 'normal' flow distribution.  If this client's
-        network gets attacked, the reconstruction error will spike, and
-        the updated weights (incorporating the new attack-learned boundary)
-        will be shared with the federation.
-
-        When cfg.DP_ENABLED is True and Opacus is available, both the AE
-        and AttackHead optimizers are wrapped with separate PrivacyEngine
-        instances for DP-SGD.  This provides formal (ε,δ)-differential
-        privacy guarantees on both training passes.
-
-        Returns:  (num_training_examples, final_batch_loss)
-        """
+        from aura.local_training import run_two_pass_local_training
+        
         ae = self.model.autoencoder
-        ae.train()
-
-        dataset = torch.utils.data.TensorDataset(self.train_data)
-        loader  = torch.utils.data.DataLoader(
-            dataset, batch_size=cfg.AE_BATCH_SIZE, shuffle=True
-        )
-
-        # ── DP-SGD: wrap AE optimizer with Opacus PrivacyEngine ──────────
-        # Fresh optimizer each round because Opacus requires attaching to
-        # a clean optimizer (hooks from previous rounds would conflict
-        # after global weight loading).
-        optimizer = torch.optim.Adam(
-            ae.parameters(), lr=cfg.AE_LEARNING_RATE
-        )
-        privacy_engine = None
-
-        if self.dp_enabled:
-            privacy_engine = PrivacyEngine()
-            # make_private replaces ae, optimizer, loader with DP-wrapped versions
-            # that compute per-sample gradients, clip to max_grad_norm, and add
-            # calibrated Gaussian noise.
-            ae, optimizer, loader = privacy_engine.make_private(
-                module=ae,
-                optimizer=optimizer,
-                data_loader=loader,
-                noise_multiplier=cfg.DP_NOISE_MULTIPLIER,
-                max_grad_norm=cfg.DP_MAX_GRAD_NORM,
-            )
-            logger.info(
-                f"  [{self.client_id}] DP-SGD attached: "
-                f"σ={cfg.DP_NOISE_MULTIPLIER}  "
-                f"C={cfg.DP_MAX_GRAD_NORM}  "
-                f"δ={cfg.DP_DELTA}"
-            )
-
-        # ── Training loop ────────────────────────────────────────────────
-        last_loss = 0.0
-        for epoch in range(self.local_epochs):
-            epoch_loss = 0.0
-            for (batch,) in loader:
-                optimizer.zero_grad()
-                x_hat, z = ae(batch)
-                # Use F.mse_loss directly — Opacus needs the loss to flow
-                # cleanly through the wrapped module for per-sample gradients.
-                loss = F.mse_loss(x_hat, batch)
-                loss.backward()
-
-                if not self.dp_enabled:
-                    # Manual gradient clipping when DP is off (DP handles its
-                    # own per-sample clipping via max_grad_norm)
-                    torch.nn.utils.clip_grad_norm_(
-                        ae.parameters(), max_norm=1.0
-                    )
-
-                optimizer.step()
-                epoch_loss += loss.item()
-
-            last_loss = epoch_loss / max(len(loader), 1)
-            logger.debug(f"  [{self.client_id}] epoch={epoch+1}  loss={last_loss:.4f}")
-
-        # ── Report DP privacy budget ─────────────────────────────────────
-        if privacy_engine is not None:
-            self.last_epsilon = privacy_engine.get_epsilon(delta=cfg.DP_DELTA)
-            logger.info(
-                f"  [{self.client_id}] DP training complete. "
-                f"ε={self.last_epsilon:.4f}, δ={cfg.DP_DELTA}"
-            )
-        else:
-            self.last_epsilon = 0.0
-
-        # ── Pass 2: AttackHead (MLP) training — NO DP ──────────────────────
-        # AttackHead trains on AE latent z vectors (16-dim compressed
-        # representations), NOT on raw private flow data. The DP guarantee
-        # is for the AE training only (Pass 1 above). Applying Opacus to the
-        # AttackHead would be semantically incorrect: z vectors are already
-        # 78→16 compressed, and the AttackHead gradient does not expose
-        # individual raw flow records.
         head = self.model.attack_head
-
-        # Use unwrapped AE for inference (no grad, no DP hooks needed)
-        ae_unwrapped = ae._module if hasattr(ae, '_module') else ae
-        ae_unwrapped.eval()
-        with torch.no_grad():
-            recon_all, z_all = ae_unwrapped(self.train_data)
-            mse_per_flow = F.mse_loss(
-                recon_all, self.train_data, reduction='none'
-            ).mean(dim=1)
-
-        mse_split = getattr(
-            cfg, 'CH2_MSE_SPLIT_THRESHOLD', cfg.MSE_THRESHOLD_HIGH
+        
+        ae_optimizer = torch.optim.Adam(ae.parameters(), lr=cfg.AE_LEARNING_RATE)
+        head_optimizer = torch.optim.Adam(head.parameters(), lr=cfg.AE_LEARNING_RATE)
+        
+        privacy_engine = None
+        if self.dp_enabled and OPACUS_AVAILABLE:
+            from opacus import PrivacyEngine
+            privacy_engine = PrivacyEngine()
+            
+            loader = torch.utils.data.DataLoader(
+                torch.utils.data.TensorDataset(self.train_data), batch_size=256
+            )
+            dp_result = privacy_engine.make_private(
+                module=ae, optimizer=ae_optimizer, data_loader=loader,
+                noise_multiplier=cfg.DP_NOISE_MULTIPLIER, max_grad_norm=cfg.DP_MAX_GRAD_NORM
+            )
+            ae = dp_result[0]
+            ae_optimizer = dp_result[1]
+            dp_loader = dp_result[2]
+            
+        mse_split = getattr(cfg, 'CH2_MSE_SPLIT_THRESHOLD', cfg.MSE_THRESHOLD_HIGH)
+        
+        z_buffer, n_benign, n_high_mse, last_loss = run_two_pass_local_training(
+            ae, head, self.train_data,
+            ae_optimizer, head_optimizer,
+            mse_threshold=mse_split,
+            head_epochs=3,
+            privacy_engine=privacy_engine
         )
-        high_mse_mask = mse_per_flow > mse_split
-        n_high_mse = int(high_mse_mask.sum().item())
-
-        if n_high_mse > 0:
-            z_high = z_all[high_mse_mask].detach()
-            mse_weights = mse_per_flow[high_mse_mask].detach()
-            mse_weights = (mse_weights - mse_weights.min()) / \
-                          (mse_weights.max() - mse_weights.min() + 1e-8)
-            pseudo_labels = torch.ones(n_high_mse, device=z_high.device)
-
-            head_dataset = torch.utils.data.TensorDataset(
-                z_high, pseudo_labels, mse_weights
-            )
-            head_loader = torch.utils.data.DataLoader(
-                head_dataset,
-                batch_size=min(cfg.AE_BATCH_SIZE, n_high_mse),
-                shuffle=True,
-            )
-
-            head.train()
-            head_optimizer = torch.optim.Adam(
-                head.parameters(), lr=cfg.AE_LEARNING_RATE
-            )
-            # Plain training — no Opacus. AttackHead trains on z vectors,
-            # not raw private data; DP is not applicable here.
-            for _ep in range(3):
-                for z_batch, lbl_batch, w_batch in head_loader:
-                    head_optimizer.zero_grad()
-                    preds = head(z_batch).squeeze(-1)
-                    loss_head = F.binary_cross_entropy(
-                        preds, lbl_batch, weight=w_batch
-                    )
-                    loss_head.backward()
-                    head_optimizer.step()
-        else:
-            logger.debug(
-                f"  [{self.client_id}] No high-MSE flows "
-                f"(threshold={mse_split:.4f}) \u2014 AttackHead training skipped"
-            )
-
-        # Unwrap the DP-wrapped model back to the original autoencoder.
-        # IMPORTANT: remove_hooks() first — reassigning ae._module alone does
-        # NOT strip the forward/backward hooks Opacus attached in-place to
-        # the underlying layers. Without this, next round's make_private()
-        # on the same module raises "Trying to add hooks twice to the same model".
+        
+        assert n_benign > 0 or n_high_mse > 0, "FATAL: No flows processed in two-pass training"
+        logger.info(f"Two-pass: benign={n_benign}, high_mse={n_high_mse}, z_buffer={sum(len(z) for z in z_buffer)}")
+        
         if self.dp_enabled and hasattr(ae, 'remove_hooks'):
+            self.last_epsilon = privacy_engine.get_epsilon(delta=cfg.DP_DELTA)
             ae.remove_hooks()
             self.model.autoencoder = ae._module
         elif self.dp_enabled:
             self.model.autoencoder = ae
-
+            
         return len(self.train_data), last_loss
 
 

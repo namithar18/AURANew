@@ -95,7 +95,7 @@ class FLDashboardService:
             return
 
         def _worker():
-            from aura.blockchain import AURABlockchainLogger
+            from aura.merkle_tree import MerkleTree
             from aura.fl_server import run_federation_simulation
 
             with self._state_lock:
@@ -107,8 +107,8 @@ class FLDashboardService:
                 self.round_results = []
 
             try:
-                bc = AURABlockchainLogger()
-                results = run_federation_simulation(blockchain_module=bc, n_rounds=self.total_rounds)
+                mt = MerkleTree()
+                results = run_federation_simulation(merkle_tree=mt, n_rounds=self.total_rounds)
 
                 for step_idx in range(len(PIPE_STEPS)):
                     with self._state_lock:
