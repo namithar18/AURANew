@@ -245,7 +245,8 @@ def run_experiment(
     mode:            str = "dc_fltrust",
     num_rounds:      int = 10,
     attack_mode:     str = "none",
-    seed:            int = None
+    seed:            int = None,
+    export_tensors:  bool = False
 ):
     """
     Run the AURA federation loop locally (no gRPC/Flower overhead).
@@ -312,7 +313,19 @@ def run_experiment(
             "Run train.py before benchmark_byzantine.py."
         )
     state = torch.load(bundle_path, map_location='cpu', weights_only=True)
-    global_model.load_state_dict(state, strict=False)
+    incompatible_keys = global_model.load_state_dict(state, strict=False)
+    if incompatible_keys.missing_keys or incompatible_keys.unexpected_keys:
+        logger.warning(f"[INIT] Checkpoint mismatches found in {bundle_path}:")
+        if incompatible_keys.missing_keys:
+            logger.warning(f"       Missing keys: {incompatible_keys.missing_keys}")
+        if incompatible_keys.unexpected_keys:
+            logger.warning(f"       Unexpected keys: {incompatible_keys.unexpected_keys}")
+        
+        # Fail loudly if ANY autoencoder keys are missing, as that breaks Channel 1
+        ae_missing = [k for k in incompatible_keys.missing_keys if k.startswith('autoencoder')]
+        if ae_missing:
+            raise RuntimeError(f"Architecture mismatch! Missing Autoencoder keys: {ae_missing}")
+            
     global_model.autoencoder.eval()
     logger.info(f"[INIT] Loaded pretrained bundle from {bundle_path}")
 
@@ -468,9 +481,28 @@ def run_experiment(
             g_ae_w = {k: v.clone() for k, v in global_model.autoencoder.state_dict().items()}
             g_head_w = {k: v.clone() for k, v in global_model.attack_head.state_dict().items()}
             
-            r_ae_delta, _, _, _, _ = _run_local_training_dual(
-                root_ae, root_head, root_data, root_ae_opt, root_head_opt, g_ae_w, g_head_w, mse_threshold_high=cfg.CH2_MSE_SPLIT_THRESHOLD, batch_size=-1
-            )
+            # ── Strategy B: Deterministic full-batch root AE reference ────────────
+            # The server's AE reference must execute the same number of optimizer
+            # updates as an honest client in one FL round. A client's AE does one
+            # DataLoader pass over its benign flows at batch_size=AE_BATCH_SIZE.
+            # The equivalent server trajectory is ceil(n_root / AE_BATCH_SIZE)
+            # full-batch (deterministic, no shuffle) Adam steps.  This is computed
+            # dynamically so it stays synchronized if root size or batch size change.
+            import math as _math
+            _n_root_steps = _math.ceil(len(root_data) / cfg.AE_BATCH_SIZE)
+            print(f"[ROOT] Strategy B: {_n_root_steps} full-batch AE steps "
+                  f"(root={len(root_data)}, bs={cfg.AE_BATCH_SIZE})")
+            
+            root_ae.train()
+            for _step in range(_n_root_steps):
+                root_ae_opt.zero_grad()
+                _recon, _ = root_ae(root_data)
+                _ae_loss = F.mse_loss(_recon, root_data)
+                _ae_loss.backward()
+                root_ae_opt.step()
+            
+            r_ae_delta = {k: root_ae.state_dict()[k].clone() - g_ae_w[k]
+                          for k in g_ae_w}
             
             from aura.root_gradient import _build_root_head_reference
             r_head_delta = _build_root_head_reference(
@@ -525,7 +557,39 @@ def run_experiment(
                 )
             
             client_round_counts = [rnd] * num_clients
-            
+
+            import torch.nn.functional as F_func
+            def _flat_norm(d):
+                return torch.cat([v.flatten() for v in d.values()]).norm()
+            def _cos(d1, d2):
+                t1 = torch.cat([v.flatten() for v in d1.values()])
+                t2 = torch.cat([v.flatten() for v in d2.values()])
+                if t1.norm() == 0 or t2.norm() == 0: return 0.0
+                return F_func.cosine_similarity(t1.unsqueeze(0), t2.unsqueeze(0)).item()
+
+            benchmark_ch1 = []
+            for idx, ae_d in enumerate(c_ae_deltas):
+                raw_cos = _cos(r_ae_delta, ae_d)
+                relu_cos = max(0.0, raw_cos)
+                benchmark_ch1.append(relu_cos)
+
+            if export_tensors:
+                import pickle
+                export_path = cfg.MODELS_DIR / f"exported_tensors_seed_{seed}_round_{rnd}.pkl"
+                with open(export_path, 'wb') as f:
+                    pickle.dump({
+                        'root_ae_delta': r_ae_delta,
+                        'client_ae_deltas': c_ae_deltas,
+                        'roles': roles,
+                        'metadata': {
+                            'seed': seed,
+                            'round': rnd,
+                            'attack_mode': attack_mode,
+                            'benchmark_ch1': benchmark_ch1
+                        }
+                    }, f)
+                logger.info(f"[EXPORT] Saved tensors and benchmark metrics to {export_path}")
+
             root_head_flat = torch.cat([v.flatten() for v in r_head_delta.values()])
             print(f"[DIAGNOSTIC] root_head_delta norm: {root_head_flat.norm():.6f}")
             print(f"[DIAGNOSTIC] root_ae_delta norm: {torch.cat([v.flatten() for v in r_ae_delta.values()]).norm():.6f}")
@@ -547,6 +611,17 @@ def run_experiment(
                 classifications = ['HEALTHY' if t > 0.0 else 'BYZANTINE' for t in trust_scores]
             else:
                 # mode == 'dc_fltrust'
+                print(f"Root AE delta norm: {_flat_norm(r_ae_delta):.6f}")
+                print(f"Root AttackHead delta norm: {_flat_norm(r_head_delta):.6f}")
+                print("--- BENCHMARK PRE-AGGREGATION DIAGNOSTICS ---")
+                
+                for idx, (ae_d, h_d, role) in enumerate(zip(c_ae_deltas, c_head_deltas, roles)):
+                    raw_cos = _cos(r_ae_delta, ae_d)
+                    relu_cos = benchmark_ch1[idx]
+                    ch2_cos = _cos(r_head_delta, h_d) if h_d is not None else 0.0
+                    print(f"Client {idx} | Role: {role} | Raw: {raw_cos:.6f} | ReLU: {relu_cos:.6f} | Ch2: {ch2_cos:.6f}")
+                print("---------------------------------------------")
+
                 new_ae, new_head, ch1_scores, ch2_scores, classifications = dc_fltrust_aggregate(
                     c_ae_deltas, c_head_deltas, r_ae_delta, r_head_delta, client_round_counts,
                     ch2_warmup_rounds=cfg.CH2_WARMUP_ROUNDS,
@@ -642,6 +717,7 @@ def main():
         default='none'
     )
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--export-tensors', action='store_true', help='Export deltas to pkl')
     args = parser.parse_args()
 
     np.random.seed(args.seed)
@@ -654,7 +730,7 @@ def main():
     
     num_clients = 5
     ratio = 0.2  # 1 byzantine client
-    run_experiment("FLTrust", num_clients, byzantine_ratio=ratio, mode=args.mode, num_rounds=args.rounds, attack_mode=args.attack_mode, seed=args.seed)
+    run_experiment("FLTrust", num_clients, byzantine_ratio=ratio, mode=args.mode, num_rounds=args.rounds, attack_mode=args.attack_mode, seed=args.seed, export_tensors=args.export_tensors)
 
     print("\n" + "=" * 70)
     print("  Byzantine Benchmark Complete.")

@@ -51,26 +51,24 @@ def _run_latent_inversion_byzantine(
     this attack without any knowledge of other clients' data or the 
     server's aggregation weights.
     """
-    # Honest AE training
+    from aura.local_training import run_two_pass_local_training
+    
+    # 1. Canonical honest AE training (head_epochs=0 to skip honest head training)
+    # This guarantees mathematical identity with honest clients.
+    _, n_benign, n_attack, _ = run_two_pass_local_training(
+        ae, attack_head, all_flows, ae_optimizer, head_optimizer,
+        mse_threshold=mse_threshold_high, head_epochs=0, batch_size=256
+    )
+
+    # Re-compute mask to avoid modifying the subsequent AttackHead code
     ae.eval()
     with torch.no_grad():
         recon, _ = ae(all_flows)
-        mse_per_flow = F.mse_loss(
-            recon, all_flows, reduction='none'
-        ).mean(dim=1)
+        mse_per_flow = F.mse_loss(recon, all_flows, reduction='none').mean(dim=1)
     ae.train()
     
-    benign_mask = mse_per_flow < mse_threshold_high
-    high_mse_mask = ~benign_mask
-    
-    benign_flows = all_flows[benign_mask]
-    if len(benign_flows) > 0:
-        ae_optimizer.zero_grad()
-        recon_b, _ = ae(benign_flows)
-        ae_loss = F.mse_loss(recon_b, benign_flows)
-        ae_loss.backward()
-        ae_optimizer.step()
-        
+    high_mse_mask = mse_per_flow >= mse_threshold_high
+    benign_flows = all_flows[~high_mse_mask]
     ae_delta = {k: ae.state_dict()[k].clone() - global_ae_weights[k]
                 for k in ae.state_dict()}
                 
