@@ -481,23 +481,23 @@ def run_experiment(
             g_ae_w = {k: v.clone() for k, v in global_model.autoencoder.state_dict().items()}
             g_head_w = {k: v.clone() for k, v in global_model.attack_head.state_dict().items()}
             
-            # ── Strategy B: Deterministic full-batch root AE reference ────────────
-            # The server's AE reference must execute the same number of optimizer
-            # updates as an honest client in one FL round. A client's AE does one
-            # DataLoader pass over its benign flows at batch_size=AE_BATCH_SIZE.
-            # The equivalent server trajectory is ceil(n_root / AE_BATCH_SIZE)
-            # full-batch (deterministic, no shuffle) Adam steps.  This is computed
-            # dynamically so it stays synchronized if root size or batch size change.
-            import math as _math
-            _n_root_steps = _math.ceil(len(root_data) / cfg.AE_BATCH_SIZE)
-            print(f"[ROOT] Strategy B: {_n_root_steps} full-batch AE steps "
-                  f"(root={len(root_data)}, bs={cfg.AE_BATCH_SIZE})")
+            # ── Strategy B: Symmetric Mini-batch root AE reference ────────────
+            # The server's AE reference must execute the same optimization trajectory
+            # as an honest client in one FL round. We wrap root_data in a DataLoader
+            # exactly like run_two_pass_local_training.
+            actual_bs = min(cfg.AE_BATCH_SIZE, len(root_data)) if cfg.AE_BATCH_SIZE > 0 else len(root_data)
+            root_loader = torch.utils.data.DataLoader(
+                torch.utils.data.TensorDataset(root_data),
+                batch_size=actual_bs, shuffle=True
+            )
+            print(f"[ROOT] Strategy B: Symmetric Mini-batch AE steps "
+                  f"(root={len(root_data)}, bs={actual_bs})")
             
             root_ae.train()
-            for _step in range(_n_root_steps):
+            for (batch,) in root_loader:
                 root_ae_opt.zero_grad()
-                _recon, _ = root_ae(root_data)
-                _ae_loss = F.mse_loss(_recon, root_data)
+                _recon, _ = root_ae(batch)
+                _ae_loss = F.mse_loss(_recon, batch)
                 _ae_loss.backward()
                 root_ae_opt.step()
             
@@ -579,7 +579,11 @@ def run_experiment(
                 with open(export_path, 'wb') as f:
                     pickle.dump({
                         'root_ae_delta': r_ae_delta,
+                        'root_head_delta': r_head_delta,
                         'client_ae_deltas': c_ae_deltas,
+                        'client_head_deltas': c_head_deltas,
+                        'global_ae_weights': g_ae_w,
+                        'global_head_weights': g_head_w,
                         'roles': roles,
                         'metadata': {
                             'seed': seed,
