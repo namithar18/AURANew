@@ -67,7 +67,7 @@ def main():
     print(f"C2 head weight: {c2_weight_B:.4f}")
     
     print("\n--- Mode C (DC-FLTrust) ---")
-    agg_ae_C, agg_head_C, ch1_C, ch2_C, classes_C = dc_fltrust_aggregate(
+    agg_ae_C, agg_head_C, ch1_C, ch2_C, classes_C, exclusion_flags = dc_fltrust_aggregate(
         c_ae_deltas, c_head_deltas, root_ae, root_head, client_round_counts,
         ch2_warmup_rounds=10
     )
@@ -87,7 +87,7 @@ def main():
     print(f"{'C2 head weight:':<17} {'N/A':<18} {c2_weight_B:<17.4f} {c2_weight_C:<20.1f} (excluded)")
     
     assert c2_weight_B > 0.0, "Mode B failed to assign non-zero weight to C2 head"
-    assert 'BYZANTINE' in classes_C[2] and c2_weight_C == 0.0, "Mode C failed to exclude C2 head"
+    assert exclusion_flags[2] and c2_weight_C == 0.0, "Mode C failed to exclude C2 head"
     print("\nTests passed successfully!")
 
 if __name__ == "__main__":

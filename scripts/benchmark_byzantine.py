@@ -622,7 +622,7 @@ def run_experiment(
                     print(f"Client {idx} | Role: {role} | Raw: {raw_cos:.6f} | ReLU: {relu_cos:.6f} | Ch2: {ch2_cos:.6f}")
                 print("---------------------------------------------")
 
-                new_ae, new_head, ch1_scores, ch2_scores, classifications = dc_fltrust_aggregate(
+                new_ae, new_head, ch1_scores, ch2_scores, classifications, exclusion_flags = dc_fltrust_aggregate(
                     c_ae_deltas, c_head_deltas, r_ae_delta, r_head_delta, client_round_counts,
                     ch2_warmup_rounds=cfg.CH2_WARMUP_ROUNDS,
                     round_z_submissions=round_z_submissions,
@@ -644,7 +644,10 @@ def run_experiment(
             
             new_arrays = [p.detach().cpu().numpy() for p in global_model.parameters()]
             
-            flagged_indices = [i for i, c in enumerate(classifications) if 'BYZANTINE' in c]
+            if mode == 'dc_fltrust':
+                flagged_indices = [i for i, excl in enumerate(exclusion_flags) if excl]
+            else:
+                flagged_indices = [i for i, c in enumerate(classifications) if 'BYZANTINE' in c]
             
             for idx in range(num_clients):
                 print(f"  [{mode}] Client {idx:2d} [{roles[idx]:10s}] ch1={ch1_scores[idx]:.4f} ch2={ch2_scores[idx] if ch2_scores[idx] is not None else 0.0:.4f} -> {classifications[idx]}")
