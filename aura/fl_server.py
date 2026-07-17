@@ -431,6 +431,9 @@ def dc_fltrust_aggregate(
     ch2_scores = []       # ReLU cosine for ch2 (used in aggregation weights)
     ch2_raw_scores = []   # Signed cosine for ch2 (used in classification only)
     classifications = []
+    exclusion_flags = []
+    warmup_flags = []
+    under_attack_flags = []
 
     for i, (ae_delta, head_delta, rounds) in enumerate(
         zip(client_ae_deltas, client_head_deltas, client_round_counts)
@@ -499,63 +502,39 @@ def dc_fltrust_aggregate(
         ch2_scores.append(ch2 if isinstance(ch2, float) else 0.0)
         ch2_raw_scores.append(ch2_raw)
 
-        # ── Classification uses ch2_raw (signed) so anti-aligned Byzantines
-        #    are detected even though their ReLU ch2 == 0.0 ────────────────
+        # ── Step 1: Explicit Boolean Predicates ──────────────────────────────────
+        ANTI_ALIGN_THRESHOLD = -0.1
+
         if ch2_raw == 'WARMUP':
-            classification = 'WARMUP'
-
-        elif ch2_raw is None:
-            # Client past warmup but submitted no head delta (no attack flows seen).
-            # This is the legitimate "healthy, quiet network" case.
-            if ch1 > ch1_threshold:
-                classification = 'HEALTHY'
-            else:
-                classification = 'BYZANTINE'
-
+            is_warmup = True
+            is_ch1_adversarial = False
+            is_ch2_adversarial = False
+            is_under_attack = False
+            should_exclude = False
         else:
-            # ch2_raw is a signed float.  Three regimes matter:
-            #
-            #   ch2_raw > +0.5  → AttackHead aligned with server reference
-            #                     (honest client learning attack patterns)
-            #   -0.1 ≤ ch2_raw ≤ +0.5 → weak or absent alignment
-            #                     (honest client, few/no attack flows)
-            #   ch2_raw < -0.1  → AttackHead ANTI-ALIGNED with server reference
-            #                     (Byzantine Latent Inversion — trains AttackHead
-            #                      with inverted pseudo-labels to suppress detection)
-            #
-            # The -0.1 dead-band prevents random noise near zero from triggering
-            # false BYZANTINE_FAKE_ATTACK classifications.
+            is_warmup = False
+            is_ch1_adversarial = (ch1 <= ch1_threshold)
+            is_ch2_adversarial = (ch2_raw is not None) and (ch2_raw < ANTI_ALIGN_THRESHOLD)
+            is_under_attack = (ch2_raw is not None) and (ch2_raw > 0.5) and (not is_ch1_adversarial)
+            # The canonical decision rule:
+            should_exclude = is_ch1_adversarial or is_ch2_adversarial
 
-            ANTI_ALIGN_THRESHOLD = -0.1   # below this → deliberate inversion
+        exclusion_flags.append(should_exclude)
+        warmup_flags.append(is_warmup)
+        under_attack_flags.append(is_under_attack)
 
+        # ── Step 3: Pure Presentation Strings ────────────────────────────────────
+        if is_warmup:
+            classification = 'WARMUP'
+        elif ch2_raw is None:
+            classification = 'HEALTHY' if not is_ch1_adversarial else 'BYZANTINE'
+        else:
             if ch2_raw < ANTI_ALIGN_THRESHOLD:
-                # Anti-aligned AttackHead submitted — Latent Inversion attack.
-                # ch1 may be high (honest AE) but the head is clearly adversarial.
-                if ch1 > ch1_threshold:
-                    # High AE alignment + anti-aligned head → Latent Inversion
-                    classification = 'BYZANTINE_FAKE_ATTACK'
-                else:
-                    # Low ch1 AND anti-aligned head → plain Byzantine
-                    classification = 'BYZANTINE'
-
+                classification = 'BYZANTINE_FAKE_ATTACK' if not is_ch1_adversarial else 'BYZANTINE'
             elif ch2_raw > 0.5:
-                if ch1 > ch1_threshold:
-                    # High AE alignment, high AttackHead alignment
-                    # → honest client whose network is under real attack
-                    classification = 'UNDER_ATTACK'
-                else:
-                    # Low AE alignment, high AttackHead alignment
-                    # → Byzantine faking an attack signal to gain ch2 trust
-                    classification = 'BYZANTINE_FAKE_ATTACK'
-
+                classification = 'UNDER_ATTACK' if not is_ch1_adversarial else 'BYZANTINE_FAKE_ATTACK'
             else:
-                # ch2_raw in [−0.1, 0.5]: weak or no attack signal
-                if ch1 > ch1_threshold:
-                    # Honest client — AE aligned, AttackHead quiet
-                    classification = 'HEALTHY'
-                else:
-                    # Low ch1 AND weak ch2 → Byzantine with no credible signal
-                    classification = 'BYZANTINE'
+                classification = 'HEALTHY' if not is_ch1_adversarial else 'BYZANTINE'
 
         classifications.append(classification)
 
@@ -566,10 +545,11 @@ def dc_fltrust_aggregate(
             f"ch1={ch1:.4f}  ch2_raw={_ch2r_str}  ch2_relu={_ch2_str}  -> {classification}"
         )
     
+    # ── Step 2: Boolean-driven Aggregation ───────────────────────────────────
     # Aggregate AE weights — exclude Byzantine clients from ch1
     ch1_weights = torch.tensor([
-        s if c not in ('BYZANTINE', 'BYZANTINE_FAKE_ATTACK') else 0.0
-        for s, c in zip(ch1_scores, classifications)
+        s if not excl else 0.0
+        for s, excl in zip(ch1_scores, exclusion_flags)
     ])
     ch1_norm = ch1_weights.sum()
     if ch1_norm > 0:
@@ -577,8 +557,8 @@ def dc_fltrust_aggregate(
     
     # === Attack Reference Buffer Update ===
     if round_z_submissions is not None and attack_ref_buffer is not None:
-        for client_id, classification in enumerate(classifications):
-            if classification == 'UNDER_ATTACK':
+        for client_id, is_under_attack in enumerate(under_attack_flags):
+            if is_under_attack:
                 if client_id < len(round_z_submissions) and round_z_submissions[client_id] is not None:
                     z_submission = round_z_submissions[client_id]
                     if len(z_submission) > 0:
@@ -604,8 +584,8 @@ def dc_fltrust_aggregate(
     # Aggregate head weights — only from clients with active ch2 and not Byzantine
     ch2_weights = torch.tensor([
         (s if s is not None and isinstance(s, float) else 0.0)
-        if c not in ('BYZANTINE', 'BYZANTINE_FAKE_ATTACK', 'WARMUP') else 0.0
-        for s, c in zip(ch2_scores, classifications)
+        if not (excl or wrm) else 0.0
+        for s, excl, wrm in zip(ch2_scores, exclusion_flags, warmup_flags)
     ])
     ch2_norm = ch2_weights.sum()
     if ch2_norm > 0:
@@ -616,8 +596,8 @@ def dc_fltrust_aggregate(
               for k in client_ae_deltas[0]}
     
     active_head_updates = [
-        (w, d) for w, d, c in zip(ch2_weights, client_head_deltas, classifications)
-        if c not in ('BYZANTINE', 'BYZANTINE_FAKE_ATTACK', 'WARMUP') and d is not None
+        (w, d) for w, d, excl, wrm in zip(ch2_weights, client_head_deltas, exclusion_flags, warmup_flags)
+        if not (excl or wrm) and d is not None
     ]
     
     if active_head_updates:
@@ -626,7 +606,7 @@ def dc_fltrust_aggregate(
     else:
         agg_head = None  # no head update this round
     
-    return agg_ae, agg_head, ch1_scores, ch2_scores, classifications
+    return agg_ae, agg_head, ch1_scores, ch2_scores, classifications, exclusion_flags
 
 
 def fltrust_aggregate(
@@ -963,8 +943,8 @@ class KrumFedAURA(FedAvg):
 
         client_round_counts = [server_round] * n_received
 
-        agg_ae_delta, agg_head_delta, ch1_scores, ch2_scores, classifications = dc_fltrust_aggregate(
-            client_ae_deltas   = client_ae_deltas,
+        agg_ae_delta, agg_head_delta, ch1_scores, ch2_scores, classifications, exclusion_flags = dc_fltrust_aggregate(
+            client_ae_deltas=client_ae_deltas,
             client_head_deltas = client_head_deltas,
             root_ae_delta      = root_ae_delta,
             root_head_delta    = root_head_delta,
@@ -990,10 +970,10 @@ class KrumFedAURA(FedAvg):
         # Recombine into a single flat list matching model_to_ndarrays layout
         aggregated = aggregated_ae + aggregated_head
 
-        # Map DC-FLTrust classifications to flagged_indices for downstream logging
+        # Map DC-FLTrust exclusion flags to flagged_indices for downstream logging
         flagged_indices = [
-            i for i, c in enumerate(classifications)
-            if c in ('BYZANTINE', 'BYZANTINE_FAKE_ATTACK')
+            i for i, excluded in enumerate(exclusion_flags)
+            if excluded
         ]
         trust_scores = ch1_scores  # use ch1 as the primary trust score for logs
 

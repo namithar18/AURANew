@@ -115,7 +115,7 @@ def run_verify():
     c2_weight_B = combined_B[2] / total_B
     
     # Mode C — pass buffer so UNDER_ATTACK z vectors are accumulated
-    agg_ae_C, agg_head_C, ch1_C, ch2_C, classes_C = dc_fltrust_aggregate(
+    agg_ae_C, agg_head_C, ch1_C, ch2_C, classes_C, exclusion_flags = dc_fltrust_aggregate(
         c_ae_deltas, c_head_deltas, r_ae_delta, r_head_delta, client_round_counts,
         ch2_warmup_rounds=0,
         round_z_submissions=round_z_submissions,

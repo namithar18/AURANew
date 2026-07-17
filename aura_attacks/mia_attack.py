@@ -44,56 +44,35 @@ LATENT_DIM   = 16
 DECODER_DIMS = [24, 32]
 
 
-class _StandaloneAE(nn.Module):
-    """Mirrors AURA's FlowAutoencoder exactly."""
-    def __init__(self):
-        super().__init__()
-        enc_dims = [FEATURE_DIM] + ENCODER_DIMS + [LATENT_DIM]
-        enc = []
-        for i in range(len(enc_dims) - 1):
-            enc += [nn.Linear(enc_dims[i], enc_dims[i+1]), nn.ReLU()]
-        self.encoder = nn.Sequential(*enc)
-
-        dec_dims = [LATENT_DIM] + DECODER_DIMS + [FEATURE_DIM]
-        dec = []
-        for i in range(len(dec_dims) - 1):
-            dec.append(nn.Linear(dec_dims[i], dec_dims[i+1]))
-            if i < len(dec_dims) - 2:
-                dec.append(nn.ReLU())
-        self.decoder = nn.Sequential(*dec)
-
-    def forward(self, x):
-        return self.decoder(self.encoder(x))
-
-    def recon_error(self, x):
-        with torch.no_grad():
-            return ((self.forward(x) - x) ** 2).mean(dim=-1)
 
 
 def _load_real_model():
-    try:
-        from aura.models import FlowAutoencoder
-        path = AURA_ROOT / "saved_models" / "autoencoder_best.pth"
-        m = FlowAutoencoder()
-        m.load_state_dict(torch.load(path, map_location="cpu"))
-        m.eval()
-        print(f"[MIA] Loaded: {path}")
-        # Wrap real model to add recon_error if it doesn't have one
-        if not hasattr(m, "recon_error"):
-            def recon_error(x):
-                with torch.no_grad():
-                    out = m(x)
-                    recon = out[0] if isinstance(out, tuple) else out
-                    return ((recon - x) ** 2).mean(dim=-1)
-            m.recon_error = recon_error
-        return m
-    except Exception as e:
-        print(f"[MIA] Could not load real checkpoint ({e}). Using random weights.")
-        m = _StandaloneAE(); m.eval(); return m
+    from aura.models import AURAModelBundle
+    # The benchmark_byzantine.py exports the final global model bundle here.
+    path = AURA_ROOT / "saved_models" / "aura_bundle_post_fl_dc_fltrust.pth"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing benchmark checkpoint: {path}\nRun scripts/benchmark_byzantine.py first.")
+    
+    bundle = AURAModelBundle()
+    bundle.load_state_dict(torch.load(path, map_location="cpu"))
+    m = bundle.autoencoder
+    m.eval()
+    print(f"[MIA] Loaded benchmark model: {path}")
+    
+    # Wrap real model to add recon_error if it doesn't have one
+    if not hasattr(m, "recon_error"):
+        def recon_error(x):
+            with torch.no_grad():
+                out = m(x)
+                recon = out[0] if isinstance(out, tuple) else out
+                return ((recon - x) ** 2).mean(dim=-1)
+        m.recon_error = recon_error
+    return m
 
 
 def _train_shadow(data, epochs=30):
-    m = _StandaloneAE()
+    from aura.models import FlowAutoencoder
+    m = FlowAutoencoder()
     opt = torch.optim.Adam(m.parameters(), lr=1e-3)
     fn = nn.MSELoss()
     m.train()
@@ -133,22 +112,27 @@ def shadow_model_mia(victim, member, nonmember, n_shadows=6, n_per=200,
         g1 = torch.Generator().manual_seed(200 + i)
         g2 = torch.Generator().manual_seed(800 + i)
 
-        if shadow_data is not None:
-            # Real data: split into disjoint train/holdout for this shadow
-            n = min(n_per, len(shadow_data) // 2)
-            perm = torch.randperm(len(shadow_data),
-                                  generator=torch.Generator().manual_seed(42 + i))
-            tr  = shadow_data[perm[:n]]
-            hld = shadow_data[perm[n:2 * n]]
-        else:
-            # Synthetic fallback — use only when no real shadow data available.
-            # NOTE: produces near-random AUROC due to distribution mismatch.
-            tr  = torch.randn(n_per, FEATURE_DIM, generator=g1)
-            hld = torch.randn(n_per, FEATURE_DIM, generator=g2)
+        if shadow_data is None:
+            raise ValueError("shadow_data must be provided. Synthetic random data invalidates the evaluation.")
+            
+        # Real data: split into disjoint train/holdout for this shadow
+        n = min(n_per, len(shadow_data) // 2)
+        perm = torch.randperm(len(shadow_data),
+                              generator=torch.Generator().manual_seed(42 + i))
+        tr  = shadow_data[perm[:n]]
+        hld = shadow_data[perm[n:2 * n]]
 
         sh = _train_shadow(tr)
-        X += [sh.recon_error(tr).unsqueeze(1),
-              sh.recon_error(hld).unsqueeze(1)]
+        
+        # We need recon_error logic on the local FlowAutoencoder.
+        def _recon(mdl, x_batch):
+            with torch.no_grad():
+                out = mdl(x_batch)
+                r = out[0] if isinstance(out, tuple) else out
+                return ((r - x_batch) ** 2).mean(dim=-1)
+                
+        X += [_recon(sh, tr).unsqueeze(1),
+              _recon(sh, hld).unsqueeze(1)]
         y += [1] * len(tr) + [0] * len(hld)
 
     clf = LogisticRegression()
@@ -231,9 +215,9 @@ if __name__ == "__main__":
     all_results = []
 
     for org in clients:
-        print(f"\n{'─'*60}")
+        print(f"\n{'-'*60}")
         print(f"  Client: org_{org}")
-        print(f"{'─'*60}")
+        print(f"{'-'*60}")
 
         member, nonmember = _load_real_client_data(org, args.n_samples)
         print(f"  Members (training rows):     {member.shape[0]}")
@@ -245,7 +229,12 @@ if __name__ == "__main__":
               f"Threshold={t['threshold']:.6f}")
 
         print("\n  [Attack 2 — Shadow-model MIA (Shokri et al. 2017)]")
-        s = shadow_model_mia(victim, member, nonmember)
+        # Find a surrogate client's data to train shadow models on
+        shadow_org = [o for o in ALL_ORGS if o != org][0]
+        shadow_train, shadow_val = _load_real_client_data(shadow_org, args.n_samples * 2)
+        shadow_pool = torch.cat([shadow_train, shadow_val], dim=0)
+        
+        s = shadow_model_mia(victim, member, nonmember, shadow_data=shadow_pool)
         print(f"    AUC={s['auc']:.4f}  Acc={s['accuracy']:.4f}")
 
         best_auc = max(t['auc'], s['auc'])
@@ -266,7 +255,7 @@ if __name__ == "__main__":
     print("  SUMMARY — Membership Inference Attack Results")
     print("="*60)
     print(f"  {'Client':<14} {'Threshold AUC':>14} {'Shadow AUC':>12} {'Best AUC':>10}  Verdict")
-    print(f"  {'─'*14} {'─'*14} {'─'*12} {'─'*10}  {'─'*18}")
+    print(f"  {'-'*14} {'-'*14} {'-'*12} {'-'*10}  {'-'*18}")
     for r in all_results:
         print(f"  {r['client']:<14} {r['threshold_auc']:>14.4f} {r['shadow_auc']:>12.4f} "
               f"{r['best_auc']:>10.4f}  {r['verdict']}")

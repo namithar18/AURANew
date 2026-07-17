@@ -481,23 +481,49 @@ def run_experiment(
             g_ae_w = {k: v.clone() for k, v in global_model.autoencoder.state_dict().items()}
             g_head_w = {k: v.clone() for k, v in global_model.attack_head.state_dict().items()}
             
-            # ── Strategy B: Deterministic full-batch root AE reference ────────────
-            # The server's AE reference must execute the same number of optimizer
-            # updates as an honest client in one FL round. A client's AE does one
-            # DataLoader pass over its benign flows at batch_size=AE_BATCH_SIZE.
-            # The equivalent server trajectory is ceil(n_root / AE_BATCH_SIZE)
-            # full-batch (deterministic, no shuffle) Adam steps.  This is computed
-            # dynamically so it stays synchronized if root size or batch size change.
-            import math as _math
-            _n_root_steps = _math.ceil(len(root_data) / cfg.AE_BATCH_SIZE)
-            print(f"[ROOT] Strategy B: {_n_root_steps} full-batch AE steps "
-                  f"(root={len(root_data)}, bs={cfg.AE_BATCH_SIZE})")
+            # ── Strategy B: Symmetric Mini-batch root AE reference ────────────
+            # The server's AE reference must execute the same optimization trajectory
+            # as an honest client in one FL round. We wrap root_data in a DataLoader
+            # exactly like run_two_pass_local_training.
+
+            # Pass 0: classify flows without updating weights
+            root_ae.eval()
+            with torch.no_grad():
+                _recon_pass0, _ = root_ae(root_data)
+                mse_per_root_flow = F.mse_loss(_recon_pass0, root_data, reduction='none').mean(dim=1)
+            
+            root_benign_mask = mse_per_root_flow < cfg.CH2_MSE_SPLIT_THRESHOLD
+            filtered_root_data = root_data[root_benign_mask]
+            
+            discarded_root_data = root_data[~root_benign_mask]
+            kept_mse = mse_per_root_flow[root_benign_mask]
+            discarded_mse = mse_per_root_flow[~root_benign_mask]
+            
+            print(f"[ROOT DIAGNOSTICS]")
+            print(f"  Initial root samples:    {len(root_data)}")
+            print(f"  Filtered root samples:   {len(filtered_root_data)}")
+            print(f"  Discarded root samples:  {len(discarded_root_data)}")
+            print(f"  Percentage discarded:    {100.0 * len(discarded_root_data) / len(root_data):.2f}%")
+            if len(kept_mse) > 0: print(f"  Mean kept MSE:           {kept_mse.mean().item():.6f}")
+            if len(discarded_mse) > 0: print(f"  Mean discarded MSE:      {discarded_mse.mean().item():.6f}")
+
+            actual_bs = min(cfg.AE_BATCH_SIZE, len(filtered_root_data)) if cfg.AE_BATCH_SIZE > 0 else len(filtered_root_data)
+            if len(filtered_root_data) > 0:
+                root_loader = torch.utils.data.DataLoader(
+                    torch.utils.data.TensorDataset(filtered_root_data),
+                    batch_size=actual_bs, shuffle=True
+                )
+            else:
+                root_loader = []
+                
+            print(f"[ROOT] Strategy B: Symmetric Mini-batch AE steps "
+                  f"(root={len(filtered_root_data)}, bs={actual_bs})")
             
             root_ae.train()
-            for _step in range(_n_root_steps):
+            for (batch,) in root_loader:
                 root_ae_opt.zero_grad()
-                _recon, _ = root_ae(root_data)
-                _ae_loss = F.mse_loss(_recon, root_data)
+                _recon, _ = root_ae(batch)
+                _ae_loss = F.mse_loss(_recon, batch)
                 _ae_loss.backward()
                 root_ae_opt.step()
             
@@ -579,7 +605,11 @@ def run_experiment(
                 with open(export_path, 'wb') as f:
                     pickle.dump({
                         'root_ae_delta': r_ae_delta,
+                        'root_head_delta': r_head_delta,
                         'client_ae_deltas': c_ae_deltas,
+                        'client_head_deltas': c_head_deltas,
+                        'global_ae_weights': g_ae_w,
+                        'global_head_weights': g_head_w,
                         'roles': roles,
                         'metadata': {
                             'seed': seed,
@@ -622,7 +652,7 @@ def run_experiment(
                     print(f"Client {idx} | Role: {role} | Raw: {raw_cos:.6f} | ReLU: {relu_cos:.6f} | Ch2: {ch2_cos:.6f}")
                 print("---------------------------------------------")
 
-                new_ae, new_head, ch1_scores, ch2_scores, classifications = dc_fltrust_aggregate(
+                new_ae, new_head, ch1_scores, ch2_scores, classifications, exclusion_flags = dc_fltrust_aggregate(
                     c_ae_deltas, c_head_deltas, r_ae_delta, r_head_delta, client_round_counts,
                     ch2_warmup_rounds=cfg.CH2_WARMUP_ROUNDS,
                     round_z_submissions=round_z_submissions,
@@ -644,7 +674,10 @@ def run_experiment(
             
             new_arrays = [p.detach().cpu().numpy() for p in global_model.parameters()]
             
-            flagged_indices = [i for i, c in enumerate(classifications) if 'BYZANTINE' in c]
+            if mode == 'dc_fltrust':
+                flagged_indices = [i for i, excl in enumerate(exclusion_flags) if excl]
+            else:
+                flagged_indices = [i for i, c in enumerate(classifications) if 'BYZANTINE' in c]
             
             for idx in range(num_clients):
                 print(f"  [{mode}] Client {idx:2d} [{roles[idx]:10s}] ch1={ch1_scores[idx]:.4f} ch2={ch2_scores[idx] if ch2_scores[idx] is not None else 0.0:.4f} -> {classifications[idx]}")

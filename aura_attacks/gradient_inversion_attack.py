@@ -65,53 +65,6 @@ LATENT_DIM   = 16
 DECODER_DIMS = [24, 32]
 
 
-class _StandaloneAE(nn.Module):
-    def __init__(self):
-        super().__init__()
-        enc_dims = [FEATURE_DIM] + ENCODER_DIMS + [LATENT_DIM]
-        enc = []
-        for i in range(len(enc_dims)-1):
-            enc += [nn.Linear(enc_dims[i], enc_dims[i+1]), nn.ReLU()]
-        self.encoder = nn.Sequential(*enc)
-        dec_dims = [LATENT_DIM] + DECODER_DIMS + [FEATURE_DIM]
-        dec = []
-        for i in range(len(dec_dims)-1):
-            dec.append(nn.Linear(dec_dims[i], dec_dims[i+1]))
-            if i < len(dec_dims)-2:
-                dec.append(nn.ReLU())
-        self.decoder = nn.Sequential(*dec)
-
-    def forward(self, x):
-        return self.decoder(self.encoder(x))
-
-
-class _StandaloneHead(nn.Module):
-    """Mirrors AURA's AttackHead exactly: z [16] -> 8 -> 1, sigmoid output."""
-    def __init__(self, latent_dim: int = LATENT_DIM):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim, 8), nn.ReLU(),
-            nn.Linear(8, 1), nn.Sigmoid(),
-        )
-
-    def forward(self, z):
-        return self.net(z)
-
-
-def _get_ae_grad(model, x):
-    model.zero_grad()
-    nn.MSELoss()(model(x), x).backward()
-    return [p.grad.detach().clone() for p in model.parameters()]
-
-
-def _get_head_grad(head, ae, x, pseudo_label_value: float = 1.0):
-    with torch.no_grad():
-        z = ae.encoder(x)
-    head.zero_grad()
-    preds = head(z).squeeze(-1)
-    labels = torch.full_like(preds, pseudo_label_value)
-    F.binary_cross_entropy(preds, labels).backward()
-    return [p.grad.detach().clone() for p in head.parameters()]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -167,7 +120,9 @@ def dlg_invert(
 def invert_ae_direct(ae: nn.Module, true_grad: list, batch_size: int, steps: int, restarts: int) -> torch.Tensor:
     """Channel 1 direct: dummy x -> MSE(model(x), x) -> match true AE gradient."""
     def loss_fn(model, dummy):
-        return nn.MSELoss()(model(dummy), dummy)
+        # AURA's FlowAutoencoder returns (recon, z). We optimize against recon.
+        recon, _ = model(dummy)
+        return nn.MSELoss()(recon, dummy)
     return dlg_invert(ae, true_grad, (batch_size, FEATURE_DIM), loss_fn, steps, restarts)
 
 
@@ -243,35 +198,60 @@ if __name__ == "__main__":
     ap.add_argument("--restarts",   type=int, default=3)
     args = ap.parse_args()
 
-    torch.manual_seed(0)
-    org_names = ["hospital", "bank", "university", "isp", "retail"][:args.n_clients]
-
-    global_ae   = _StandaloneAE()
-    global_head = _StandaloneHead()
+    from aura.models import FlowAutoencoder, AttackHead
+    import pickle
 
     print("\n" + "="*72)
     print("  AURA — Gradient Inversion (DLG), dual-channel")
     print("="*72)
     print(f"  {args.restarts} random restarts x {args.steps} steps per inversion, "
           f"batch_size={args.batch_size}\n")
+          
+    export_path = AURA_ROOT / "saved_models" / "exported_tensors_seed_0_round_1.pkl"
+    if not export_path.exists():
+        raise FileNotFoundError(f"Missing benchmark checkpoint: {export_path}\nRun benchmark_byzantine with --export-tensors.")
+        
+    print(f"  Loading canonical exported tensors from round 1...")
+    with open(export_path, 'rb') as f:
+        data = pickle.load(f)
+
+    global_ae = FlowAutoencoder()
+    global_ae.load_state_dict(data['global_ae_weights'])
+    global_ae.eval()
+    
+    global_head = AttackHead()
+    global_head.load_state_dict(data['global_head_weights'])
+    global_head.eval()
+
+    c_ae_deltas = data['client_ae_deltas']
+    c_head_deltas = data['client_head_deltas']
+    roles = data['roles']
 
     ch1_leaks, ch2_leaks, chain_leaks = [], [], []
 
-    for name in org_names:
-        data = torch.randn(args.batch_size, FEATURE_DIM,
-                            generator=torch.Generator().manual_seed(hash(name) % 10_000))
-        true_z = global_ae.encoder(data).detach()
+    # The canonical dataset loader to get true client batch for MSE evaluation
+    from aura.data_loader import load_client_partition
+    org_names_all = ["hospital", "bank", "university", "isp", "retail"]
 
-        ae_local   = copy.deepcopy(global_ae)
-        head_local = copy.deepcopy(global_head)
-        ae_grad   = _get_ae_grad(ae_local, data)
-        head_grad = _get_head_grad(head_local, global_ae, data)
+    for i in range(min(args.n_clients, len(c_ae_deltas))):
+        name = org_names_all[i]
+        print(f"  -- org_{name} ({roles[i]}) --")
+        
+        # Ground truth data batch for reference (first batch of their train partition)
+        client_id = f"org_{name}_1"
+        X_train, _ = load_client_partition(client_id)
+        true_data = X_train[:args.batch_size].clone()
+        with torch.no_grad():
+            _, true_z = global_ae(true_data)
 
-        print(f"  -- org_{name} --")
+        # In DP-SGD, delta = W_{t+1} - W_t = -lr * grad. 
+        # We use -delta as the gradient target for DLG matching.
+        ae_grad = [-c_ae_deltas[i][k].cpu() for k, _ in global_ae.named_parameters()]
+        head_grad = [-c_head_deltas[i][k].cpu() for k, _ in global_head.named_parameters()]
 
         x_hat_direct = invert_ae_direct(copy.deepcopy(global_ae), ae_grad,
                                         args.batch_size, args.steps, args.restarts)
-        ch1_leaks.append(_report("Channel 1 direct  (grad -> x)", x_hat_direct, data))
+        ch1_leaks.append(_report("Channel 1 direct  (grad -> x)", x_hat_direct, true_data))
 
         z_hat = invert_head_direct(copy.deepcopy(global_head), head_grad,
                                     args.batch_size, args.steps, args.restarts)
@@ -279,7 +259,7 @@ if __name__ == "__main__":
 
         z_hat_chain, x_hat_chain = chained_attack(copy.deepcopy(global_ae), copy.deepcopy(global_head),
                                                   head_grad, args.batch_size, args.steps, args.restarts)
-        chain_leaks.append(_report("Chained (ch2 grad -> z -> x)", x_hat_chain, data))
+        chain_leaks.append(_report("Chained (ch2 grad -> z -> x)", x_hat_chain, true_data))
         print()
 
     def _avg(xs):

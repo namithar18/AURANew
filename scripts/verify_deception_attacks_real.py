@@ -229,16 +229,18 @@ def run_benchmark(train_benign, train_attack, mode, attack_mode, rounds, seed):
                 for k in g_head_w:
                     g_head_w[k] += agg_head[k]
         else:
-            agg_ae, agg_head, ch1, ch2, classes = dc_fltrust_aggregate(
+            agg_ae, agg_head, ch1, ch2, classes, exclusion_flags = dc_fltrust_aggregate(
                 c_ae_deltas, c_head_deltas, r_ae_delta, r_head_delta, client_round_counts,
                 ch2_warmup_rounds=0, ch1_threshold=cfg.FLTRUST_CH1_THRESHOLD
             )
             ch1_history.append(ch1[0])
             ch2_history.append(ch2[0] if ch2[0] is not None else 0.0)
             
-            active_weights = [t for i, t in enumerate(ch1) if classes[i] in ('HEALTHY', 'UNDER_ATTACK')]
-            combined_weight = ch1[0] / sum(active_weights) if classes[0] in ('HEALTHY', 'UNDER_ATTACK') and sum(active_weights) > 0 else 0.0
-            head_weight = 0.0 if classes[0] in ('HEALTHY', 'BYZANTINE_FAKE_ATTACK', 'BYZANTINE') else combined_weight
+            active_weights = [t for i, t in enumerate(ch1) if not exclusion_flags[i]]
+            combined_weight = ch1[0] / sum(active_weights) if not exclusion_flags[0] and sum(active_weights) > 0 else 0.0
+            
+            is_under_attack = (ch2[0] is not None and ch2[0] > 0.5 and not exclusion_flags[0])
+            head_weight = combined_weight if is_under_attack else 0.0
             
             for k in g_ae_w:
                 g_ae_w[k] += agg_ae[k]
