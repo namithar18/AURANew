@@ -485,13 +485,39 @@ def run_experiment(
             # The server's AE reference must execute the same optimization trajectory
             # as an honest client in one FL round. We wrap root_data in a DataLoader
             # exactly like run_two_pass_local_training.
-            actual_bs = min(cfg.AE_BATCH_SIZE, len(root_data)) if cfg.AE_BATCH_SIZE > 0 else len(root_data)
-            root_loader = torch.utils.data.DataLoader(
-                torch.utils.data.TensorDataset(root_data),
-                batch_size=actual_bs, shuffle=True
-            )
+
+            # Pass 0: classify flows without updating weights
+            root_ae.eval()
+            with torch.no_grad():
+                _recon_pass0, _ = root_ae(root_data)
+                mse_per_root_flow = F.mse_loss(_recon_pass0, root_data, reduction='none').mean(dim=1)
+            
+            root_benign_mask = mse_per_root_flow < cfg.CH2_MSE_SPLIT_THRESHOLD
+            filtered_root_data = root_data[root_benign_mask]
+            
+            discarded_root_data = root_data[~root_benign_mask]
+            kept_mse = mse_per_root_flow[root_benign_mask]
+            discarded_mse = mse_per_root_flow[~root_benign_mask]
+            
+            print(f"[ROOT DIAGNOSTICS]")
+            print(f"  Initial root samples:    {len(root_data)}")
+            print(f"  Filtered root samples:   {len(filtered_root_data)}")
+            print(f"  Discarded root samples:  {len(discarded_root_data)}")
+            print(f"  Percentage discarded:    {100.0 * len(discarded_root_data) / len(root_data):.2f}%")
+            if len(kept_mse) > 0: print(f"  Mean kept MSE:           {kept_mse.mean().item():.6f}")
+            if len(discarded_mse) > 0: print(f"  Mean discarded MSE:      {discarded_mse.mean().item():.6f}")
+
+            actual_bs = min(cfg.AE_BATCH_SIZE, len(filtered_root_data)) if cfg.AE_BATCH_SIZE > 0 else len(filtered_root_data)
+            if len(filtered_root_data) > 0:
+                root_loader = torch.utils.data.DataLoader(
+                    torch.utils.data.TensorDataset(filtered_root_data),
+                    batch_size=actual_bs, shuffle=True
+                )
+            else:
+                root_loader = []
+                
             print(f"[ROOT] Strategy B: Symmetric Mini-batch AE steps "
-                  f"(root={len(root_data)}, bs={actual_bs})")
+                  f"(root={len(filtered_root_data)}, bs={actual_bs})")
             
             root_ae.train()
             for (batch,) in root_loader:
