@@ -194,7 +194,7 @@ def _run_local_training_dual(
 ) -> tuple:
     from aura.local_training import run_two_pass_local_training
     
-    z_buffer, n_benign, n_high_mse, _ = run_two_pass_local_training(
+    z_buffer, n_benign, n_high_mse, _, step16_state = run_two_pass_local_training(
         ae, attack_head, all_flows,
         ae_optimizer, head_optimizer,
         mse_threshold=mse_threshold_high,
@@ -205,8 +205,10 @@ def _run_local_training_dual(
     assert n_benign > 0 or n_high_mse > 0, "FATAL: No flows processed in two-pass training"
     logger.info(f"Two-pass: benign={n_benign}, high_mse={n_high_mse}, z_buffer={sum(len(z) for z in z_buffer)}")
     
-    ae_delta = {k: ae.state_dict()[k].clone() - global_ae_weights[k]
-                for k in ae.state_dict()}
+    # Export Step-16 state for CH1
+    ae_delta = {k: step16_state[k] - global_ae_weights[k]
+                for k in step16_state}
+    
     if n_high_mse > 0:
         head_delta = {k: attack_head.state_dict()[k].clone() - global_head_weights[k]
                       for k in attack_head.state_dict()}

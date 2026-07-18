@@ -491,7 +491,7 @@ class AURAFlowerClient(fl.client.Client):
             
         mse_split = getattr(cfg, 'CH2_MSE_SPLIT_THRESHOLD', cfg.MSE_THRESHOLD_HIGH)
         
-        z_buffer, n_benign, n_high_mse, last_loss = run_two_pass_local_training(
+        z_buffer, n_benign, n_high_mse, last_loss, _ = run_two_pass_local_training(
             ae, head, self.train_data,
             ae_optimizer, head_optimizer,
             mse_threshold=mse_split,

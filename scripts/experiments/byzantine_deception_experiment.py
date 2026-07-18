@@ -55,7 +55,7 @@ def _run_latent_inversion_byzantine(
     
     # 1. Canonical honest AE training (head_epochs=0 to skip honest head training)
     # This guarantees mathematical identity with honest clients.
-    _, n_benign, n_attack, _ = run_two_pass_local_training(
+    _, n_benign, n_attack, _, step16_state = run_two_pass_local_training(
         ae, attack_head, all_flows, ae_optimizer, head_optimizer,
         mse_threshold=mse_threshold_high, head_epochs=0, batch_size=256
     )
@@ -69,8 +69,8 @@ def _run_latent_inversion_byzantine(
     
     high_mse_mask = mse_per_flow >= mse_threshold_high
     benign_flows = all_flows[~high_mse_mask]
-    ae_delta = {k: ae.state_dict()[k].clone() - global_ae_weights[k]
-                for k in ae.state_dict()}
+    ae_delta = {k: step16_state[k] - global_ae_weights[k]
+                for k in step16_state}
                 
     # Latent Inversion on AttackHead
     attack_flows = all_flows[high_mse_mask]
